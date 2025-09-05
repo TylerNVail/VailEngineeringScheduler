@@ -1,14 +1,10 @@
 import streamlit as st
 import pandas as pd
-from datetime import time
+from datetime import datetime, timedelta
 
-# ========== PAGE CONFIG ==========
-st.set_page_config(
-    page_title="Homecare Scheduler",
-    layout="wide",
-)
+st.set_page_config(page_title="Homecare Scheduler", layout="wide")
 
-# ========== LOAD DATA ==========
+# ========== HELPERS ==========
 def load_csv(filename):
     try:
         return pd.read_csv(filename)
@@ -19,128 +15,124 @@ caregivers_df = load_csv("caregivers.csv")
 clients_df = load_csv("clients.csv")
 approvals_df = load_csv("approvals.csv")
 
-# ========== SIDEBAR ==========
-st.sidebar.title("Navigation")
-tabs = ["Caregivers", "Clients", "Schedule", "Exceptions", "Settings"]
-selected_tab = st.sidebar.radio("Go to:", tabs)
+days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+time_slots = [f"{(datetime(2000,1,1,0,0) + timedelta(minutes=30*i)).strftime('%H:%M')}" for i in range(48)]
 
-# ========== CAREGIVER TAB ==========
-if selected_tab == "Caregivers":
-    st.title("Caregiver Profiles")
-    st.write("Add new caregivers or edit existing profiles.")
+# ========== MAIN NAVIGATION ==========
+main_tabs = st.tabs(["Profiles", "Schedules", "Settings"])
 
-    with st.form("add_caregiver"):
-        name = st.text_input("Caregiver Name")
-        base_location = st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"])
-        min_hours = st.number_input("Minimum Hours", 0, 80, 20)
-        max_hours = st.number_input("Maximum Hours", 0, 80, 40)
-        as_many_as_possible = st.checkbox("As many hours as possible")
-        submitted = st.form_submit_button("Save Caregiver")
+# ====== PROFILES TAB ======
+with main_tabs[0]:
+    st.header("Profiles")
+    sub_tabs = st.tabs(["Caregivers", "Clients"])
 
-        if submitted:
-            new_row = {
-                "name": name,
-                "base_location": base_location,
-                "min_hours": min_hours,
-                "max_hours": max_hours,
-                "as_many_as_possible": as_many_as_possible
-            }
-            caregivers_df = pd.concat([caregivers_df, pd.DataFrame([new_row])], ignore_index=True)
-            caregivers_df.to_csv("caregivers.csv", index=False)
-            st.success(f"Caregiver {name} saved!")
+    # --- Caregivers ---
+    with sub_tabs[0]:
+        st.subheader("Caregiver Profiles")
+        caregiver_names = ["New"] + caregivers_df["name"].tolist() if not caregivers_df.empty else ["New"]
+        selected = st.selectbox("Select Caregiver", caregiver_names)
 
-    if not caregivers_df.empty:
-        st.subheader("Existing Caregivers")
-        st.dataframe(caregivers_df)
-
-# ========== CLIENT TAB ==========
-elif selected_tab == "Clients":
-    st.title("Client Profiles")
-    st.write("Add new clients and their care needs.")
-
-    with st.form("add_client"):
-        name = st.text_input("Client Name")
-        base_location = st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"])
-        importance = st.slider("Importance (0-10)", 0, 10, 5)
-        scheduling_mode = st.selectbox("Scheduling Mode", ["Maximize Client Preference", "Maximize Fairness"])
-        preferred_caregivers = st.text_area("Preferred Caregivers (comma-separated)")
-        submitted = st.form_submit_button("Save Client")
-
-        if submitted:
-            new_row = {
-                "name": name,
-                "base_location": base_location,
-                "importance": importance,
-                "scheduling_mode": scheduling_mode,
-                "preferred_caregivers": preferred_caregivers
-            }
-            clients_df = pd.concat([clients_df, pd.DataFrame([new_row])], ignore_index=True)
-            clients_df.to_csv("clients.csv", index=False)
-            st.success(f"Client {name} saved!")
-
-    if not clients_df.empty:
-        st.subheader("Existing Clients")
-        st.dataframe(clients_df)
-
-# ========== SCHEDULE TAB ==========
-elif selected_tab == "Schedule":
-    st.title("Weekly Schedule")
-    st.write("Auto-generate or manually review schedules.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Generate Schedule"):
-            # Placeholder for solver integration
-            st.info("Running solver... (to be integrated)")
-    with col2:
-        if st.button("Save Schedule"):
-            st.success("Schedule saved to CSV.")
-
-    st.write("📅 Current Week’s Schedule")
-    # Placeholder schedule table
-    schedule_df = pd.DataFrame({
-        "Day": ["Mon", "Tue", "Wed"],
-        "Client": ["Client A", "Client B", "Client C"],
-        "Caregiver": ["John Doe", "Jane Smith", "Joe Brown"],
-        "Start": ["09:00", "10:00", "14:00"],
-        "End": ["13:00", "14:00", "18:00"]
-    })
-    st.dataframe(schedule_df)
-
-# ========== EXCEPTIONS TAB ==========
-elif selected_tab == "Exceptions":
-    st.title("Exceptions Review")
-    st.write("Approve or decline hard-constraint exceptions.")
-
-    # Placeholder exceptions
-    exceptions = [
-        {"id": 1, "desc": "Joe Doe travels Oroville → Chico (Tue 14–20h)", "auto": False},
-        {"id": 2, "desc": "Jane Smith split 8h block into 2 shifts (Wed 09–17h)", "auto": True},
-    ]
-
-    approvals = []
-    for exc in exceptions:
-        col1, col2 = st.columns([4,1])
-        with col1:
-            label = f"{'⚡' if exc['auto'] else ''} {exc['desc']}"
-            st.write(label)
-        with col2:
-            decision = st.radio(
-                f"Decision {exc['id']}",
-                ["Pending", "Approve", "Decline"],
-                key=f"exc_{exc['id']}"
+        if selected == "New":
+            name = st.text_input("Name")
+            base_location = st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"])
+            min_hours = st.number_input("Min Hours", 0, 80, 20)
+            max_hours = st.number_input("Max Hours", 0, 80, 40)
+            as_many = st.checkbox("As many hours as possible")
+            st.markdown("### Weekly Availability")
+            caregiver_matrix = pd.DataFrame(
+                [["Unavailable"]*7 for _ in time_slots], 
+                columns=days, index=time_slots
             )
-            approvals.append((exc["id"], decision))
+            st.dataframe(caregiver_matrix, use_container_width=True)
 
-    if st.button("Resolve Exceptions"):
-        st.write("Resolving based on decisions...")
-        st.json(approvals)
+        else:
+            row = caregivers_df[caregivers_df["name"] == selected].iloc[0]
+            st.text_input("Name", value=row["name"])
+            st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"], index=["Paradise","Chico","Oroville"].index(row["base_location"]))
+            st.number_input("Min Hours", 0, 80, int(row["min_hours"]))
+            st.number_input("Max Hours", 0, 80, int(row["max_hours"]))
+            st.checkbox("As many hours as possible", value=row["as_many_as_possible"])
+            st.markdown("### Weekly Availability")
+            # TODO: Load saved caregiver availability matrix
+            st.info("Availability matrix loading placeholder")
 
-# ========== SETTINGS TAB ==========
-elif selected_tab == "Settings":
-    st.title("Settings")
-    st.write("General app configuration.")
+    # --- Clients ---
+    with sub_tabs[1]:
+        st.subheader("Client Profiles")
+        client_names = ["New"] + clients_df["name"].tolist() if not clients_df.empty else ["New"]
+        selected = st.selectbox("Select Client", client_names)
 
+        if selected == "New":
+            name = st.text_input("Name")
+            base_location = st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"])
+            importance = st.slider("Importance (0–10)", 0, 10, 5)
+            mode = st.selectbox("Scheduling Mode", ["Maximize Client Preference", "Maximize Fairness"])
+            preferred = st.text_area("Preferred Caregivers (comma-separated)")
+            st.markdown("### Requested Coverage")
+            client_matrix = pd.DataFrame(
+                [["None"]*7 for _ in time_slots], 
+                columns=days, index=time_slots
+            )
+            st.dataframe(client_matrix, use_container_width=True)
+
+        else:
+            row = clients_df[clients_df["name"] == selected].iloc[0]
+            st.text_input("Name", value=row["name"])
+            st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"], index=["Paradise","Chico","Oroville"].index(row["base_location"]))
+            st.slider("Importance (0–10)", 0, 10, int(row["importance"]))
+            st.selectbox("Scheduling Mode", ["Maximize Client Preference", "Maximize Fairness"], index=0 if row["scheduling_mode"]=="Maximize Client Preference" else 1)
+            st.text_area("Preferred Caregivers", value=row["preferred_caregivers"])
+            st.markdown("### Requested Coverage")
+            # TODO: Load saved client coverage matrix
+            st.info("Client coverage matrix loading placeholder")
+
+# ====== SCHEDULES TAB ======
+with main_tabs[1]:
+    st.header("Schedules")
+    sub_tabs = st.tabs(["Caregivers", "Clients", "Exceptions"])
+
+    # --- Caregivers Schedule ---
+    with sub_tabs[0]:
+        st.subheader("Caregiver Schedule")
+        if not caregivers_df.empty:
+            caregiver = st.selectbox("Select Caregiver", caregivers_df["name"].tolist())
+            st.markdown(f"### Weekly Schedule for {caregiver}")
+            # TODO: Replace with actual schedule
+            schedule_matrix = pd.DataFrame(
+                [[""]*7 for _ in time_slots], 
+                columns=days, index=time_slots
+            )
+            st.dataframe(schedule_matrix, use_container_width=True)
+
+    # --- Clients Schedule ---
+    with sub_tabs[1]:
+        st.subheader("Client Schedule")
+        if not clients_df.empty:
+            client = st.selectbox("Select Client", clients_df["name"].tolist())
+            st.markdown(f"### Weekly Schedule for {client}")
+            # TODO: Replace with actual schedule
+            schedule_matrix = pd.DataFrame(
+                [[""]*7 for _ in time_slots], 
+                columns=days, index=time_slots
+            )
+            st.dataframe(schedule_matrix, use_container_width=True)
+
+    # --- Exceptions ---
+    with sub_tabs[2]:
+        st.subheader("Exceptions Review")
+        # TODO: Replace with actual unsolved shifts
+        exceptions = pd.DataFrame([
+            {"Client": "Client A", "Importance": 10, "Shift": "Tue 09–13", "Type": "Fixed"},
+            {"Client": "Client B", "Importance": 7, "Shift": "Wed 14–18", "Type": "Flexible"},
+        ])
+        st.dataframe(exceptions, use_container_width=True)
+        st.write("Approve or Decline Exceptions Below:")
+        # Placeholder for decision controls
+        st.button("Resolve Exceptions")
+
+# ====== SETTINGS TAB test ======
+with main_tabs[2]:
+    st.header("Settings")
     if st.button("Reset All Data"):
         caregivers_df.to_csv("caregivers.csv", index=False)
         clients_df.to_csv("clients.csv", index=False)
