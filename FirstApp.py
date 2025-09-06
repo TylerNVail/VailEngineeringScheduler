@@ -191,7 +191,7 @@ with tab_main[1]:
             st.info("Schedules will be displayed here after solver integration.")
 
 # -----------------------
-# --- Settings Tab test ---
+# --- Settings Tab ---
 # -----------------------
 with tab_main[2]:
     st.subheader("Settings")
