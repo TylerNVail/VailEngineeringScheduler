@@ -1,189 +1,110 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import os
 
-# --- Helper Functions ---
-def load_csv(path, default_columns):
-    try:
-        df = pd.read_csv(path)
-    except FileNotFoundError:
-        df = pd.DataFrame(columns=default_columns)
-    for col in default_columns:
-        if col not in df.columns:
-            df[col] = ""
-    return df.fillna("")
+st.set_page_config(layout="wide")
 
-def save_csv(df, path):
-    df.to_csv(path, index=False)
+# ---------- File paths ----------
+CAREGIVER_FILE = "caregivers.csv"
+CAREGIVER_AVAIL_FILE = "caregiver_availability.csv"
+CLIENT_FILE = "clients.csv"
+CLIENT_FIXED_FILE = "client_shifts_fixed.csv"
+CLIENT_FLEX_FILE = "client_shifts_flexible.csv"
 
-# --- CSV Paths ---
-caregiver_csv = "caregivers.csv"
-caregiver_availability_csv = "caregiver_availability.csv"
-client_csv = "clients.csv"
-client_fixed_shifts_csv = "client_fixed_shifts.csv"
-client_flexible_shifts_csv = "client_flexible_shifts.csv"
+# ---------- Ensure CSVs exist ----------
+for f, cols in [
+    (CAREGIVER_FILE, ["Name", "Base Location", "Notes"]),
+    (CAREGIVER_AVAIL_FILE, ["Caregiver Name", "Day", "Start", "End", "Availability Type"]),
+    (CLIENT_FILE, ["Name", "Base Location", "Importance", "Scheduling Mode", "Preferred Caregivers", "Notes"]),
+    (CLIENT_FIXED_FILE, ["Client Name", "Day", "Start", "End"]),
+    (CLIENT_FLEX_FILE, ["Client Name", "Length", "Number", "Start Day", "End Day", "Start Time", "End Time"]),
+]:
+    if not os.path.exists(f):
+        pd.DataFrame(columns=cols).to_csv(f, index=False)
 
-# --- Dropdown Options ---
-days_of_week = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-availability_types = ["Available", "Preferred Unavailable"]
-base_locations = ["Paradise", "Chico", "Oroville"]
+# ---------- Load Data ----------
+def load_data():
+    return {
+        "caregivers": pd.read_csv(CAREGIVER_FILE),
+        "caregiver_avail": pd.read_csv(CAREGIVER_AVAIL_FILE),
+        "clients": pd.read_csv(CLIENT_FILE),
+        "client_fixed": pd.read_csv(CLIENT_FIXED_FILE),
+        "client_flex": pd.read_csv(CLIENT_FLEX_FILE),
+    }
 
-# 30-minute increments
-def generate_time_options():
-    times = []
-    for h in range(24):
-        for m in [0, 30]:
-            times.append(f"{h:02d}:{m:02d}")
-    return times
-time_options = generate_time_options()
+def save_data(dfs):
+    dfs["caregivers"].to_csv(CAREGIVER_FILE, index=False)
+    dfs["caregiver_avail"].to_csv(CAREGIVER_AVAIL_FILE, index=False)
+    dfs["clients"].to_csv(CLIENT_FILE, index=False)
+    dfs["client_fixed"].to_csv(CLIENT_FIXED_FILE, index=False)
+    dfs["client_flex"].to_csv(CLIENT_FLEX_FILE, index=False)
 
-# --- Main Tabs ---
-tab_main = st.tabs(["Profiles", "Schedules", "Settings"])
+dfs = load_data()
 
-# --- Profiles Tab ---
-with tab_main[0]:
-    profile_tabs = st.tabs(["Caregivers", "Clients"])
+# ---------- Tabs ----------
+main_tab = st.tabs(["Caregiver Availability", "Client Shifts"])
 
-    # --- Caregivers ---
-    with profile_tabs[0]:
-        caregiver_subtabs = st.tabs(["Caregiver List", "Availability"])
+# --- CAREGIVER AVAILABILITY TAB ---
+with main_tab[0]:
+    st.header("Caregiver Availability")
 
-        # Caregiver List
-        with caregiver_subtabs[0]:
-            st.subheader("Caregiver List")
-            caregiver_columns = ["Name", "Base Location", "Notes"]
-            caregivers_df = load_csv(caregiver_csv, caregiver_columns)
+    if st.button("🔄 Refresh Caregivers"):
+        dfs = load_data()
+        st.experimental_rerun()
 
-            edited_caregivers = st.data_editor(
-                caregivers_df,
-                column_config={
-                    "Name": st.column_config.TextColumn("Name"),
-                    "Base Location": st.column_config.TextColumn("Base Location"),
-                    "Notes": st.column_config.TextColumn("Notes"),
-                },
-                num_rows="dynamic",
-                key="caregiver_list_editor",
-                width="stretch"
-            )
-            if st.button("Save Caregivers"):
-                save_csv(edited_caregivers, caregiver_csv)
-                st.success("Caregivers saved!")
+    caregiver_avail_updated = []
+    for name in dfs["caregivers"]["Name"].unique():
+        st.subheader(f"Availability for {name}")
+        sub_df = dfs["caregiver_avail"][dfs["caregiver_avail"]["Caregiver Name"] == name]
 
-        # Caregiver Availability
-        with caregiver_subtabs[1]:
-            st.subheader("Caregiver Availability")
-            availability_columns = ["Caregiver Name", "Day of Week", "Start", "End", "Availability Type", "Notes"]
-            availability_df = load_csv(caregiver_availability_csv, availability_columns)
+        edited = st.data_editor(
+            sub_df,
+            num_rows="dynamic",
+            key=f"caregiver_avail_{name}",
+            use_container_width=True
+        )
+        caregiver_avail_updated.append(edited)
 
-            edited_availability = st.data_editor(
-                availability_df,
-                column_config={
-                    "Caregiver Name": st.column_config.TextColumn("Caregiver Name"),
-                    "Day of Week": st.column_config.TextColumn("Day of Week"),
-                    "Start": st.column_config.TextColumn("Start Time"),
-                    "End": st.column_config.TextColumn("End Time"),
-                    "Availability Type": st.column_config.TextColumn("Availability Type"),
-                    "Notes": st.column_config.TextColumn("Notes"),
-                },
-                num_rows="dynamic",
-                key="caregiver_availability_editor",
-                width="stretch"
-            )
-            if st.button("Save Availability"):
-                save_csv(edited_availability, caregiver_availability_csv)
-                st.success("Caregiver availability saved!")
+    if st.button("💾 Save All Caregiver Availability"):
+        dfs["caregiver_avail"] = pd.concat(caregiver_avail_updated, ignore_index=True)
+        save_data(dfs)
+        st.success("Caregiver availability saved!")
 
-    # --- Clients ---
-    with profile_tabs[1]:
-        client_subtabs = st.tabs(["Client List", "Fixed Shifts", "Flexible Shifts"])
+# --- CLIENT SHIFTS TAB ---
+with main_tab[1]:
+    st.header("Client Shifts")
 
-        # Client List
-        with client_subtabs[0]:
-            st.subheader("Client List")
-            client_columns = ["Name", "Base Location", "Importance", "Scheduling Mode", "Preferred Caregivers", "Notes"]
-            clients_df = load_csv(client_csv, client_columns)
-            clients_df["Importance"] = pd.to_numeric(clients_df["Importance"], errors="coerce").fillna(0).astype(int)
+    if st.button("🔄 Refresh Clients"):
+        dfs = load_data()
+        st.experimental_rerun()
 
-            edited_clients = st.data_editor(
-                clients_df,
-                column_config={
-                    "Name": st.column_config.TextColumn("Name"),
-                    "Base Location": st.column_config.TextColumn("Base Location"),
-                    "Importance": st.column_config.NumberColumn("Importance (0-10)", min_value=0, max_value=10, step=1),
-                    "Scheduling Mode": st.column_config.TextColumn("Scheduling Mode"),
-                    "Preferred Caregivers": st.column_config.TextColumn("Preferred Caregivers (comma separated)"),
-                    "Notes": st.column_config.TextColumn("Notes"),
-                },
-                num_rows="dynamic",
-                key="client_list_editor",
-                width="stretch"
-            )
-            if st.button("Save Clients"):
-                save_csv(edited_clients, client_csv)
-                st.success("Clients saved!")
+    client_fixed_updated = []
+    client_flex_updated = []
+    for name in dfs["clients"]["Name"].unique():
+        st.subheader(f"Shifts for {name}")
 
-        # Fixed Shifts
-        with client_subtabs[1]:
-            st.subheader("Client Fixed Shifts")
-            fixed_columns = ["Client Name", "Day of Week", "Start", "End", "Notes"]
-            fixed_df = load_csv(client_fixed_shifts_csv, fixed_columns)
+        st.markdown("**Fixed Shifts**")
+        fixed_df = dfs["client_fixed"][dfs["client_fixed"]["Client Name"] == name]
+        fixed_edited = st.data_editor(
+            fixed_df,
+            num_rows="dynamic",
+            key=f"client_fixed_{name}",
+            use_container_width=True
+        )
+        client_fixed_updated.append(fixed_edited)
 
-            edited_fixed = st.data_editor(
-                fixed_df,
-                column_config={
-                    "Client Name": st.column_config.TextColumn("Client Name"),
-                    "Day of Week": st.column_config.TextColumn("Day of Week"),
-                    "Start": st.column_config.TextColumn("Start Time"),
-                    "End": st.column_config.TextColumn("End Time"),
-                    "Notes": st.column_config.TextColumn("Notes"),
-                },
-                num_rows="dynamic",
-                key="client_fixed_editor",
-                width="stretch"
-            )
-            if st.button("Save Fixed Shifts"):
-                save_csv(edited_fixed, client_fixed_shifts_csv)
-                st.success("Fixed shifts saved!")
+        st.markdown("**Flexible Shifts**")
+        flex_df = dfs["client_flex"][dfs["client_flex"]["Client Name"] == name]
+        flex_edited = st.data_editor(
+            flex_df,
+            num_rows="dynamic",
+            key=f"client_flex_{name}",
+            use_container_width=True
+        )
+        client_flex_updated.append(flex_edited)
 
-        # Flexible Shifts
-        with client_subtabs[2]:
-            st.subheader("Client Flexible Shifts")
-            flex_columns = ["Client Name", "Length (hrs)", "Number of Shifts", "Start Day", "End Day", "Start Time", "End Time", "Notes"]
-            flex_df = load_csv(client_flexible_shifts_csv, flex_columns)
-
-            edited_flex = st.data_editor(
-                flex_df,
-                column_config={
-                    "Client Name": st.column_config.TextColumn("Client Name"),
-                    "Length (hrs)": st.column_config.NumberColumn("Length of Shift (hrs)", min_value=1, step=1),
-                    "Number of Shifts": st.column_config.NumberColumn("Number of Shifts", min_value=1, step=1),
-                    "Start Day": st.column_config.TextColumn("Start Day"),
-                    "End Day": st.column_config.TextColumn("End Day"),
-                    "Start Time": st.column_config.TextColumn("Start Time"),
-                    "End Time": st.column_config.TextColumn("End Time"),
-                    "Notes": st.column_config.TextColumn("Notes"),
-                },
-                num_rows="dynamic",
-                key="client_flexible_editor",
-                width="stretch"
-            )
-            if st.button("Save Flexible Shifts"):
-                save_csv(edited_flex, client_flexible_shifts_csv)
-                st.success("Flexible shifts saved!")
-
-# --- Schedules Tab ---
-with tab_main[1]:
-    schedule_subtabs = st.tabs(["Caregivers", "Clients", "Exceptions"])
-    for subtab in schedule_subtabs:
-        with subtab:
-            st.info("Schedules will be displayed here after solver integration.")
-
-# --- Settings Tab ---
-with tab_main[2]:
-    st.subheader("Settings")
-    st.text("Currently using default CSV paths. Update paths here if needed.")
-    caregiver_csv = st.text_input("Caregiver CSV Path", caregiver_csv)
-    caregiver_availability_csv = st.text_input("Caregiver Availability CSV Path", caregiver_availability_csv)
-    client_csv = st.text_input("Client CSV Path", client_csv)
-    client_fixed_shifts_csv = st.text_input("Client Fixed Shifts CSV Path", client_fixed_shifts_csv)
-    client_flexible_shifts_csv = st.text_input("Client Flexible Shifts CSV Path", client_flexible_shifts_csv)
-    st.info("These paths will be used when saving/loading data.")
+    if st.button("💾 Save All Client Shifts"):
+        dfs["client_fixed"] = pd.concat(client_fixed_updated, ignore_index=True)
+        dfs["client_flex"] = pd.concat(client_flex_updated, ignore_index=True)
+        save_data(dfs)
+        st.success("Client shifts saved!")
