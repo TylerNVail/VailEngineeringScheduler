@@ -130,7 +130,7 @@ with main_tabs[1]:
         # Placeholder for decision controls
         st.button("Resolve Exceptions")
 
-# ====== SETTINGS TAB test ======
+# ====== SETTINGS TAB ======
 with main_tabs[2]:
     st.header("Settings")
     if st.button("Reset All Data"):
