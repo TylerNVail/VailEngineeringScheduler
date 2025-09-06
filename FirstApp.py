@@ -1,140 +1,130 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
+import os
 
-st.set_page_config(page_title="Homecare Scheduler", layout="wide")
+# ==========================
+# Default CSV file paths
+# ==========================
+def get_default_paths():
+    return {
+        "caregivers": "caregivers.csv",
+        "clients_fixed": "clients_fixed.csv",
+        "clients_flexible": "clients_flexible.csv",
+        "approvals": "approvals.csv"
+    }
 
-# ========== HELPERS ==========
-def load_csv(filename):
-    try:
-        return pd.read_csv(filename)
-    except FileNotFoundError:
-        return pd.DataFrame()
+# ==========================
+# Utility: load or create CSV
+# ==========================
+def load_or_create_csv(path, columns):
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    else:
+        df = pd.DataFrame(columns=columns)
+        df.to_csv(path, index=False)
+        return df
 
-caregivers_df = load_csv("caregivers.csv")
-clients_df = load_csv("clients.csv")
-approvals_df = load_csv("approvals.csv")
+# ==========================
+# App State Management
+# ==========================
+if "file_paths" not in st.session_state:
+    st.session_state.file_paths = get_default_paths()
 
-days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-time_slots = [f"{(datetime(2000,1,1,0,0) + timedelta(minutes=30*i)).strftime('%H:%M')}" for i in range(48)]
+# ==========================
+# Tabs Layout
+# ==========================
+tabs = st.tabs(["Profiles", "Schedules", "Settings"])
 
-# ========== MAIN NAVIGATION ==========
-main_tabs = st.tabs(["Profiles", "Schedules", "Settings"])
-
-# ====== PROFILES TAB ======
-with main_tabs[0]:
-    st.header("Profiles")
+# ==========================
+# PROFILES TAB
+# ==========================
+with tabs[0]:
     sub_tabs = st.tabs(["Caregivers", "Clients"])
 
     # --- Caregivers ---
     with sub_tabs[0]:
-        st.subheader("Caregiver Profiles")
-        caregiver_names = ["New"] + caregivers_df["name"].tolist() if not caregivers_df.empty else ["New"]
-        selected = st.selectbox("Select Caregiver", caregiver_names)
+        st.header("Caregiver Profiles")
+        caregiver_file = st.session_state.file_paths["caregivers"]
 
-        if selected == "New":
-            name = st.text_input("Name")
-            base_location = st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"])
-            min_hours = st.number_input("Min Hours", 0, 80, 20)
-            max_hours = st.number_input("Max Hours", 0, 80, 40)
-            as_many = st.checkbox("As many hours as possible")
-            st.markdown("### Weekly Availability")
-            caregiver_matrix = pd.DataFrame(
-                [["Unavailable"]*7 for _ in time_slots], 
-                columns=days, index=time_slots
-            )
-            st.dataframe(caregiver_matrix, use_container_width=True)
+        caregiver_cols = ["Name", "Base Location", "Day of Week", "Start of Availability", "End of Availability", "Availability Type"]
+        caregivers_df = load_or_create_csv(caregiver_file, caregiver_cols)
 
-        else:
-            row = caregivers_df[caregivers_df["name"] == selected].iloc[0]
-            st.text_input("Name", value=row["name"])
-            st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"], index=["Paradise","Chico","Oroville"].index(row["base_location"]))
-            st.number_input("Min Hours", 0, 80, int(row["min_hours"]))
-            st.number_input("Max Hours", 0, 80, int(row["max_hours"]))
-            st.checkbox("As many hours as possible", value=row["as_many_as_possible"])
-            st.markdown("### Weekly Availability")
-            # TODO: Load saved caregiver availability matrix
-            st.info("Availability matrix loading placeholder")
+        edited_caregivers = st.data_editor(
+            caregivers_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="caregiver_editor"
+        )
+
+        if st.button("Save Caregivers"):
+            edited_caregivers.to_csv(caregiver_file, index=False)
+            st.success("Caregivers saved!")
 
     # --- Clients ---
     with sub_tabs[1]:
-        st.subheader("Client Profiles")
-        client_names = ["New"] + clients_df["name"].tolist() if not clients_df.empty else ["New"]
-        selected = st.selectbox("Select Client", client_names)
+        st.header("Client Profiles")
 
-        if selected == "New":
-            name = st.text_input("Name")
-            base_location = st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"])
-            importance = st.slider("Importance (0–10)", 0, 10, 5)
-            mode = st.selectbox("Scheduling Mode", ["Maximize Client Preference", "Maximize Fairness"])
-            preferred = st.text_area("Preferred Caregivers (comma-separated)")
-            st.markdown("### Requested Coverage")
-            client_matrix = pd.DataFrame(
-                [["None"]*7 for _ in time_slots], 
-                columns=days, index=time_slots
-            )
-            st.dataframe(client_matrix, use_container_width=True)
+        fixed_file = st.session_state.file_paths["clients_fixed"]
+        flexible_file = st.session_state.file_paths["clients_flexible"]
 
-        else:
-            row = clients_df[clients_df["name"] == selected].iloc[0]
-            st.text_input("Name", value=row["name"])
-            st.selectbox("Base Location", ["Paradise", "Chico", "Oroville"], index=["Paradise","Chico","Oroville"].index(row["base_location"]))
-            st.slider("Importance (0–10)", 0, 10, int(row["importance"]))
-            st.selectbox("Scheduling Mode", ["Maximize Client Preference", "Maximize Fairness"], index=0 if row["scheduling_mode"]=="Maximize Client Preference" else 1)
-            st.text_area("Preferred Caregivers", value=row["preferred_caregivers"])
-            st.markdown("### Requested Coverage")
-            # TODO: Load saved client coverage matrix
-            st.info("Client coverage matrix loading placeholder")
+        # Checkbox for 24-hour client
+        is_24hr = st.checkbox("24-Hour Client", key="client_24hr")
 
-# ====== SCHEDULES TAB ======
-with main_tabs[1]:
-    st.header("Schedules")
+        st.subheader("Fixed Shifts")
+        fixed_cols = ["Name", "Day of Week", "Start of Shift", "End of Shift"]
+        fixed_df = load_or_create_csv(fixed_file, fixed_cols)
+
+        edited_fixed = st.data_editor(
+            fixed_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="fixed_editor"
+        )
+
+        st.subheader("Flexible Shifts")
+        flex_cols = ["Name", "Length of Shift (hrs)", "Number of Shifts", "Start Day", "End Day", "Start Time", "End Time"]
+        flex_df = load_or_create_csv(flexible_file, flex_cols)
+
+        edited_flex = st.data_editor(
+            flex_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="flex_editor"
+        )
+
+        if st.button("Save Clients"):
+            edited_fixed.to_csv(fixed_file, index=False)
+            edited_flex.to_csv(flexible_file, index=False)
+            st.success("Clients saved!")
+
+# ==========================
+# SCHEDULES TAB
+# ==========================
+with tabs[1]:
     sub_tabs = st.tabs(["Caregivers", "Clients", "Exceptions"])
 
-    # --- Caregivers Schedule ---
     with sub_tabs[0]:
-        st.subheader("Caregiver Schedule")
-        if not caregivers_df.empty:
-            caregiver = st.selectbox("Select Caregiver", caregivers_df["name"].tolist())
-            st.markdown(f"### Weekly Schedule for {caregiver}")
-            # TODO: Replace with actual schedule
-            schedule_matrix = pd.DataFrame(
-                [[""]*7 for _ in time_slots], 
-                columns=days, index=time_slots
-            )
-            st.dataframe(schedule_matrix, use_container_width=True)
+        st.header("Caregiver Schedules")
+        st.info("This will display caregiver schedules once solver logic is added.")
 
-    # --- Clients Schedule ---
     with sub_tabs[1]:
-        st.subheader("Client Schedule")
-        if not clients_df.empty:
-            client = st.selectbox("Select Client", clients_df["name"].tolist())
-            st.markdown(f"### Weekly Schedule for {client}")
-            # TODO: Replace with actual schedule
-            schedule_matrix = pd.DataFrame(
-                [[""]*7 for _ in time_slots], 
-                columns=days, index=time_slots
-            )
-            st.dataframe(schedule_matrix, use_container_width=True)
+        st.header("Client Schedules")
+        st.info("This will display client schedules once solver logic is added.")
 
-    # --- Exceptions ---
     with sub_tabs[2]:
-        st.subheader("Exceptions Review")
-        # TODO: Replace with actual unsolved shifts
-        exceptions = pd.DataFrame([
-            {"Client": "Client A", "Importance": 10, "Shift": "Tue 09–13", "Type": "Fixed"},
-            {"Client": "Client B", "Importance": 7, "Shift": "Wed 14–18", "Type": "Flexible"},
-        ])
-        st.dataframe(exceptions, use_container_width=True)
-        st.write("Approve or Decline Exceptions Below:")
-        # Placeholder for decision controls
-        st.button("Resolve Exceptions")
+        st.header("Exceptions")
+        st.info("Unassigned shifts and hard-constraint approvals will be shown here.")
 
-# ====== SETTINGS TAB ======
-with main_tabs[2]:
+# ==========================
+# SETTINGS TAB
+# ==========================
+with tabs[2]:
     st.header("Settings")
-    if st.button("Reset All Data"):
-        caregivers_df.to_csv("caregivers.csv", index=False)
-        clients_df.to_csv("clients.csv", index=False)
-        approvals_df.to_csv("approvals.csv", index=False)
-        st.warning("All data reset!")
+    st.write("Configure file paths for CSV storage.")
+
+    for key, default_path in st.session_state.file_paths.items():
+        new_path = st.text_input(f"Path for {key}", value=default_path, key=f"path_{key}")
+        st.session_state.file_paths[key] = new_path
+
+    if st.button("Save Settings"):
+        st.success("File paths updated! They will be used going forward.")
