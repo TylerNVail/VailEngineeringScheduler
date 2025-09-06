@@ -22,7 +22,7 @@ for f, cols in [
     if not os.path.exists(f):
         pd.DataFrame(columns=cols).to_csv(f, index=False)
 
-# ---------- Load Data ----------
+# ---------- Load & Save ----------
 def load_data():
     return {
         "caregivers": pd.read_csv(CAREGIVER_FILE),
@@ -33,6 +33,9 @@ def load_data():
     }
 
 def save_data(dfs):
+    # Remove empty rows before saving
+    for key in dfs:
+        dfs[key] = dfs[key].dropna(how="all").reset_index(drop=True)
     dfs["caregivers"].to_csv(CAREGIVER_FILE, index=False)
     dfs["caregiver_avail"].to_csv(CAREGIVER_AVAIL_FILE, index=False)
     dfs["clients"].to_csv(CLIENT_FILE, index=False)
@@ -41,7 +44,7 @@ def save_data(dfs):
 
 dfs = load_data()
 
-# ---------- Helpers for pre-populated rows ----------
+# ---------- Helpers ----------
 def ensure_min_rows(df, min_rows, defaults=None):
     """Ensure at least min_rows exist in df, filling with defaults if provided."""
     if len(df) < min_rows:
@@ -77,33 +80,32 @@ with main_tabs[0]:
     with sub_tabs[1]:
         st.header("Caregiver Availability")
 
-        if st.button("🔄 Refresh Caregivers"):
-            dfs = load_data()
-            st.experimental_rerun()
+        caregiver_names = dfs["caregivers"]["Name"].dropna().unique().tolist()
+        selected = st.selectbox("Select Caregiver", caregiver_names)
 
-        caregiver_avail_updated = []
-        for name in dfs["caregivers"]["Name"].unique():
-            st.subheader(f"Availability for {name}")
-            sub_df = dfs["caregiver_avail"][dfs["caregiver_avail"]["Caregiver Name"] == name]
+        if selected:
+            sub_df = dfs["caregiver_avail"][dfs["caregiver_avail"]["Caregiver Name"] == selected]
 
             sub_df = ensure_min_rows(
                 sub_df,
                 min_rows=3,
-                defaults={"Caregiver Name": name, "Day": "", "Start": "", "End": "", "Availability Type": ""}
+                defaults={"Caregiver Name": selected, "Day": "", "Start": "", "End": "", "Availability Type": ""}
             )
 
             edited = st.data_editor(
                 sub_df,
                 num_rows="dynamic",
-                key=f"caregiver_avail_{name}",
+                key=f"caregiver_avail_{selected}",
                 use_container_width=True
             )
-            caregiver_avail_updated.append(edited)
 
-        if st.button("💾 Save All Caregiver Availability"):
-            dfs["caregiver_avail"] = pd.concat(caregiver_avail_updated, ignore_index=True)
-            save_data(dfs)
-            st.success("Caregiver availability saved!")
+            if st.button("💾 Save Caregiver Availability"):
+                dfs["caregiver_avail"] = pd.concat(
+                    [dfs["caregiver_avail"][dfs["caregiver_avail"]["Caregiver Name"] != selected], edited],
+                    ignore_index=True
+                )
+                save_data(dfs)
+                st.success(f"Availability for {selected} saved!")
 
 # ================= CLIENTS TAB =================
 with main_tabs[1]:
@@ -129,38 +131,32 @@ with main_tabs[1]:
     with sub_tabs[1]:
         st.header("Client Shifts")
 
-        if st.button("🔄 Refresh Clients"):
-            dfs = load_data()
-            st.experimental_rerun()
+        client_names = dfs["clients"]["Name"].dropna().unique().tolist()
+        selected = st.selectbox("Select Client", client_names)
 
-        client_fixed_updated = []
-        client_flex_updated = []
-        for name in dfs["clients"]["Name"].unique():
-            st.subheader(f"Shifts for {name}")
-
+        if selected:
             st.markdown("**Fixed Shifts**")
-            fixed_df = dfs["client_fixed"][dfs["client_fixed"]["Client Name"] == name]
+            fixed_df = dfs["client_fixed"][dfs["client_fixed"]["Client Name"] == selected]
             fixed_df = ensure_min_rows(
                 fixed_df,
                 min_rows=2,
-                defaults={"Client Name": name, "Day": "", "Start": "", "End": ""}
+                defaults={"Client Name": selected, "Day": "", "Start": "", "End": ""}
             )
 
             fixed_edited = st.data_editor(
                 fixed_df,
                 num_rows="dynamic",
-                key=f"client_fixed_{name}",
+                key=f"client_fixed_{selected}",
                 use_container_width=True
             )
-            client_fixed_updated.append(fixed_edited)
 
             st.markdown("**Flexible Shifts**")
-            flex_df = dfs["client_flex"][dfs["client_flex"]["Client Name"] == name]
+            flex_df = dfs["client_flex"][dfs["client_flex"]["Client Name"] == selected]
             flex_df = ensure_min_rows(
                 flex_df,
                 min_rows=2,
                 defaults={
-                    "Client Name": name,
+                    "Client Name": selected,
                     "Length": "",
                     "Number": "",
                     "Start Day": "",
@@ -173,16 +169,21 @@ with main_tabs[1]:
             flex_edited = st.data_editor(
                 flex_df,
                 num_rows="dynamic",
-                key=f"client_flex_{name}",
+                key=f"client_flex_{selected}",
                 use_container_width=True
             )
-            client_flex_updated.append(flex_edited)
 
-        if st.button("💾 Save All Client Shifts"):
-            dfs["client_fixed"] = pd.concat(client_fixed_updated, ignore_index=True)
-            dfs["client_flex"] = pd.concat(client_flex_updated, ignore_index=True)
-            save_data(dfs)
-            st.success("Client shifts saved!")
+            if st.button("💾 Save Client Shifts"):
+                dfs["client_fixed"] = pd.concat(
+                    [dfs["client_fixed"][dfs["client_fixed"]["Client Name"] != selected], fixed_edited],
+                    ignore_index=True
+                )
+                dfs["client_flex"] = pd.concat(
+                    [dfs["client_flex"][dfs["client_flex"]["Client Name"] != selected], flex_edited],
+                    ignore_index=True
+                )
+                save_data(dfs)
+                st.success(f"Shifts for {selected} saved!")
 
 # ================= SCHEDULES TAB =================
 with main_tabs[2]:
