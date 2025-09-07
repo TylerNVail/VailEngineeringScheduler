@@ -166,8 +166,7 @@ def load_caregivers_csv(path="caregivers.csv") -> List[Caregiver]:
         return []
     df = pd.read_csv(path).fillna("")
     caregivers = []
-
-# Combined FirstApp.py  — Part 2/5
+    # Combined FirstApp.py  — Part 2/5
 # (continuation directly after Part 1)
 
     for _, row in df.iterrows():
