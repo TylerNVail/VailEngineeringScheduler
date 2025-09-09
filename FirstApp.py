@@ -1,11 +1,8 @@
-# FirstApp.py — ClearConnect (v-next2)
-# Fixes:
-# 1) 24h clients assign (paired-night placement enforced)
-# 2) Sort names by last name across UI
-# 3) Zebra rows for core profile editors
-# 4) True deletion: purge orphans on save
-# 5) 22:00–24:00 and 00:00–07:00 must be same caregiver (hard)
-# 6) Default iterations = 500
+# FirstApp.py — ClearConnect (Daytime-only 24h v1)
+# Updates:
+# - 24h clients produce only daytime blocks (07:00–22:00). Nights ignored for now.
+# - Blank availability type => treat as Available (hard).
+# - All prior UI/solver features preserved.
 
 import streamlit as st
 import pandas as pd
@@ -204,24 +201,38 @@ def travel_exception_type(city_a:str, city_b:str, pc_crossings_today:int)->Optio
 
 DAILY_AUTO_LIMIT_MIN = 9*60
 AS_MANY_WEEK_CAP_MIN = 50*60
-NIGHT_START = time_to_slot("22:00")
-NIGHT_END   = time_to_slot("07:00")
 
 def is_available(cg:Caregiver, day_full:str, start:str, end:str)->Tuple[bool,bool]:
+    """
+    Returns (hard_ok, soft_prefer_used)
+    Treat BLANK Availability Type as Available (hard). 'Preferred Unavailable' is soft (assignable).
+    """
     day_short = UI_TO_SHORT.get(day_full, day_full)
     segs = cg.availability.get(day_short, [])
     s = time_to_slot(start); e = time_to_slot(end)
     if e<=s: return (False, False)
-    if not segs: return (False, False)
+    if not segs:
+        # No rows at all -> Not available
+        return (False, False)
     span = range(s,e)
     covered = [False]*(e-s); prefer=[False]*(e-s)
     for seg in segs:
         st = time_to_slot(seg.get("start","00:00")); en = time_to_slot(seg.get("end","00:00"))
-        state = (seg.get("state","") or "").lower()
+        stype = (seg.get("state","") or "").lower().replace(" ", "_")
+        # Blank => treat as available
+        if stype == "" or stype == "available":
+            is_cov = True; is_pref = False
+        elif stype == "preferred_unavailable":
+            is_cov = True; is_pref = True
+        else:
+            # Unknown types do NOT count as coverage
+            is_cov = False; is_pref = False
+        if not is_cov:
+            continue
         for i,sl in enumerate(span):
             if st<=sl<en:
                 covered[i] = True
-                if state.startswith("prefer"):
+                if is_pref:
                     prefer[i] = True
     if not all(covered): return (False, False)
     return (True, any(prefer))
@@ -252,7 +263,6 @@ def week_hour_pref_penalty(cg:Caregiver)->float:
     if cg.as_many_hours:
         return 0.5*max(0.0, hrs-50)
     lo = cg.min_week_hours or 0.0; hi = cg.max_week_hours or 0.0
-    if lo==0 and hi==0: return 0.0
     if hi and hrs>hi: return (hrs-hi) * 0.8
     if lo and hrs<lo: return (lo-hrs) * 0.3
     return 0.0
@@ -299,94 +309,90 @@ def score_solution(assignments:List[ScheduleEntry], client_priority:Dict[str,int
         score -= week_hour_pref_penalty(cg)
     return score
 
-# ---------------- Split fixed into chunks (keeps 00–07 and 22–24) ----------------
+# ---------------- Split fixed into chunks ----------------
 def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
     """
-    Deterministic split for reliability:
-      - Always create [00:00–07:00]
-      - Split daytime 07:00–22:00 into 6–8h chunks but with a deterministic pattern:
-          07:00–13:00 (6h), 13:00–19:00 (6h), 19:00–22:00 (3h)  [the last can be 3–5h]
-      - Always create [22:00–24:00]
-    For non-24h windows, we still respect 00–07 and 22–24 edges explicitly and split the middle.
+    Deterministic, long-chunk splitting with 15-min precision.
+    For daytime 07:00–22:00 windows, produce:
+      07:00–13:00 (6h), 13:00–19:00 (6h), 19:00–22:00 (3h)
+    For arbitrary windows, cut into ~6–8h pieces (clamped to the window).
     """
     s = time_to_slot(start); e = time_to_slot(end)
     if e <= s:
         return []
-
-    chunks = []
-    # 1) 00–07 edge if overlaps
-    if s < NIGHT_END:
-        ns = s
-        ne = min(e, NIGHT_END)
-        if ns < ne:
-            chunks.append((ns, ne))
-        s = max(s, NIGHT_END)
-
-    # 2) Daytime 07–22
-    day_start = max(s, NIGHT_END)
-    day_end   = min(e, NIGHT_START)
-    if day_start < day_end:
-        # If the whole day range is inside 07–22, split deterministically:
-        # 07–13, 13–19, 19–22 (some may clamp depending on bounds)
-        anchors = [day_start, time_to_slot("13:00"), time_to_slot("19:00"), day_end]
-        # Clamp anchors to [day_start, day_end]
-        anchors = [max(day_start, min(a, day_end)) for a in anchors]
-        # Build monotone unique sequence
+    chunks=[]
+    # If fully inside daytime, use anchors for readability/consistency
+    DAY_S = time_to_slot("07:00"); DAY_E = time_to_slot("22:00")
+    if s >= DAY_S and e <= DAY_E:
+        anchors = [s, max(s, time_to_slot("13:00")), max(s, time_to_slot("19:00")), e]
+        anchors = [max(s, min(a, e)) for a in anchors]
         seq = [anchors[0]]
         for a in anchors[1:]:
             if a > seq[-1]:
                 seq.append(a)
-        # Emit consecutive segments
         for i in range(len(seq)-1):
             if seq[i] < seq[i+1]:
                 chunks.append((seq[i], seq[i+1]))
+    else:
+        # Generic: 6–8h slices, deterministic by stepping 24..32 slots
+        step = 28  # 7 hours
+        cur = s
+        while cur < e:
+            cut = min(e, cur + step)
+            chunks.append((cur, cut))
+            cur = cut
 
-    # 3) 22–24 edge if overlaps
-    if e > NIGHT_START:
-        ns = max(s, NIGHT_START)
-        ne = e
-        if ns < ne:
-            chunks.append((ns, ne))
-
-    # Merge any touching segments
-    merged = []
+    # merge touching
+    merged=[]
     for seg in chunks:
-        if not merged:
-            merged = [seg]
-        elif merged[-1][1] == seg[0]:
-            merged[-1] = (merged[-1][0], seg[1])
-        else:
-            merged.append(seg)
-
-    return [(slot_to_time(a), slot_to_time(b)) for (a,b) in merged]
+        if not merged: merged=[seg]
+        elif merged[-1][1]==seg[0]: merged[-1]=(merged[-1][0], seg[1])
+        else: merged.append(seg)
+    return [(slot_to_time(x[0]), slot_to_time(x[1])) for x in merged]
 
 # ---------------- Build client blocks ----------------
 def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
+    """
+    Key change: if client 24_Hour=True, we only generate daytime blocks 07:00–22:00 per day.
+    Nights (00:00–07:00 and 22:00–24:00) are ignored for now.
+    """
     blocks = []; flex_specs = []
+    DAY_S = "07:00"; DAY_E = "22:00"
     for c in clients:
+        is_24 = any(r.get("type")=="24flag" for r in c.requests)  # we’ll add this marker below
         for req in c.requests:
             if req.get("type") == "fixed":
-                parts = split_fixed_block(req["day"], req["start"], req["end"])
-                for st,en in parts:
+                # If 24h client, ignore parts outside daytime
+                st = max(req["start"], DAY_S) if is_24 else req["start"]
+                en = min(req["end"], DAY_E)   if is_24 else req["end"]
+                # Skip if outside daytime entirely
+                if is_24 and (en <= DAY_S or st >= DAY_E):
+                    continue
+                parts = split_fixed_block(req["day"], st, en)
+                for stt,enn in parts:
                     blocks.append({
                         "block_id": f"B_{uuid.uuid4().hex[:8]}",
                         "client_id": c.client_id,
                         "day": req["day"],
-                        "start": st,
-                        "end": en,
+                        "start": stt,
+                        "end": enn,
                         "allow_split": False,
                         "flex": False
                     })
             elif req.get("type") == "flexible":
+                # For 24h clients, flex must still land in daytime; enforce via spec (window already constrains it)
                 flex_specs.append({
                     "client_id": c.client_id,
                     "blocks": int(req["blocks"]),
                     "duration": float(req["duration"]),
                     "days": list(req["days"]),
-                    "window_start": req["window_start"],
-                    "window_end": req["window_end"],
+                    "window_start": max(req["window_start"], DAY_S) if is_24 else req["window_start"],
+                    "window_end":   min(req["window_end"], DAY_E)   if is_24 else req["window_end"],
                     "consecutive": str(req.get("consecutive","")).strip().lower() in ("true","1","t","yes","y")
                 })
+            elif req.get("type") == "24flag":
+                # marker only, nothing to append here
+                pass
     return blocks, flex_specs
 
 def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random)->List[Dict]:
@@ -409,8 +415,9 @@ def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random)->List[D
             valids=[]
             for s in range(ws, max(ws, we - dur_slots) + 1):
                 e = s + dur_slots
-                if not (NIGHT_END <= s < NIGHT_START): continue   # 07–22 start
-                if not (NIGHT_END < e <= 96): continue
+                # Ensure daytime-only placement
+                if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
+                if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
                 valids.append(s)
             rng.shuffle(valids)
             if not valids: continue
@@ -479,7 +486,6 @@ def append_pending_exceptions_to_csv(pending:List[ExceptionOption]):
         "Unavailable": "caregiver not available for the entire block",
         "Daily hours >9": "would push daily total above 9 hours",
         "Weekly hours >50 (as-many)": "would push weekly total above 50 hours (as-many-hours cap)",
-        "Night pairing": "night segments 22:00–24:00 and 00:00–07:00 must be the same caregiver",
     }
     new_rows=[]
     for ex in pending:
@@ -513,8 +519,11 @@ def build_client_objects_from_dfs(dfs):
         if str(r.get("SkipForWeek","")).strip().lower() in ("true","1","t","yes","y"): continue
         reqs=[]
         if str(r.get("24_Hour","")).strip().lower() in ("true","1","t","yes","y"):
+            # Daytime-only 24h: add 07:00–22:00 fixed for each day
             for d in DAYS_FULL:
-                reqs.append({"type":"fixed","day": d, "start":"00:00", "end":"24:00"})
+                reqs.append({"type":"fixed","day": d, "start":"07:00", "end":"22:00"})
+            # Add a marker so expand function knows to clamp other requests to daytime
+            reqs.append({"type":"24flag"})
         fixed_rows = dfs["client_fixed"][dfs["client_fixed"]["Client Name"]==r["Name"]]
         for _, fr in fixed_rows.iterrows():
             if str(fr.get("SkipForWeek","")).strip().lower() in ("true","1","t","yes","y"): continue
@@ -563,7 +572,10 @@ def build_caregiver_objects_from_dfs(dfs):
         for _, a in av_rows.iterrows():
             dshort = UI_TO_SHORT.get(a.get("Day",""), a.get("Day",""))
             if dshort:
-                av_map[dshort].append({"start": a.get("Start",""), "end": a.get("End",""), "state": (a.get("Availability Type","") or "").lower().replace(" ","_")})
+                av_map[dshort].append({
+                    "start": a.get("Start",""), "end": a.get("End",""),
+                    "state": (a.get("Availability Type","") or "")  # blank treated as Available later
+                })
         min_h = float(r.get("Min Hours (week)","") or 0)
         max_h = float(r.get("Max Hours (week)","") or 0)
         as_many = str(r.get("AsManyHours","")).strip().lower() in ("true","1","t","yes","y")
@@ -585,8 +597,9 @@ def representative_slot_for_flex(spec)->Optional[Tuple[str,str,str]]:
     for d in spec["days"]:
         for s in range(ws, max(ws, we - dur_slots) + 1):
             e = s + dur_slots
-            if not (NIGHT_END <= s < NIGHT_START): continue
-            if not (NIGHT_END < e <= 96): continue
+            # Daytime only
+            if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
+            if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
             return d, slot_to_time(s), slot_to_time(e)
     return None
 
@@ -625,7 +638,7 @@ def compute_uncovered(dfs)->Tuple[pd.DataFrame, Dict[str, List[Dict]]]:
         per_client_unfilled[f["client_id"]].append({"day": f["day"], "start": f["start"], "end": f["end"], "label": "Not covered (F)"})
     return mat, per_client_unfilled
 
-# ---------------- Solver with paired night placement ----------------
+# ---------------- Solver (no night pairing needed) ----------------
 def solve_week(
     caregivers:List[Caregiver],
     clients:List[Client],
@@ -666,12 +679,10 @@ def solve_week(
     # compose blocks
     all_blocks = fixed_blocks + place_flex_blocks_one_plan(flex_specs, rng)
 
-    # Index blocks by day + (client,start,end) for night pairing
+    # index by day
     blocks_by_day = defaultdict(list)
-    idx_by_key = {}
     for b in all_blocks:
         blocks_by_day[b["day"]].append(b)
-        idx_by_key[(b["client_id"], b["day"], b["start"], b["end"])] = b
 
     # Remove any that are locked; we’ll force-place locks first
     lock_keys = set((clid, d, st, en) for (clid, d, st, en, _, _) in locks)
@@ -741,30 +752,16 @@ def solve_week(
 
         for day in day_order:
             seq = day_round_order(day)
-            # Build fast lookup of night pair for this day per client
-            # pair: 22:00–24:00 with 00:00–07:00 (same day)
-            night_pair = {}
-            key_2200 = {}
-            key_0000 = {}
-            for b in seq:
-                s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
-                if s < NIGHT_END and e <= NIGHT_END: key_0000[(b["client_id"], day)] = b
-                if s >= NIGHT_START: key_2200[(b["client_id"], day)] = b
-            for k in key_2200:
-                if k in key_0000:
-                    night_pair[k] = (key_2200[k], key_0000[k])
-
-            used_block_ids=set()
 
             for b in seq:
-                if b["block_id"] in used_block_ids: continue
                 cl = client_map[b["client_id"]]; cl_city = cl.base_location
                 s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
-                want_pair = (b["client_id"], day) in night_pair and (time_to_slot(b["start"])>=NIGHT_START or time_to_slot(b["end"])<=NIGHT_END)
 
-                # candidates ordered: last-name sort already used in building lists; here we sort by preference & city
+                # candidates: prefer preferred caregivers & same-city first
                 cand = [c for c in caregivers if c.caregiver_id not in cl.banned_caregivers]
+                # client preference first
                 cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
+                # then same base location
                 cand.sort(key=lambda cg: 0 if cg.base_location==cl_city else 1)
 
                 placed=False; local_excs=[]
@@ -773,39 +770,15 @@ def solve_week(
                     if (cl.client_id, day, b["start"], b["end"], cg.caregiver_id) in declined_blacklist:
                         local_excs.append((cg.caregiver_id, "Declined earlier")); continue
 
-                    if not want_pair:
-                        ok, err, soft = can_place_single(cg, cl_city, day, s, e)
-                        if not ok:
-                            local_excs.append((cg.caregiver_id, err or "Constraint")); continue
-                        status = "Assigned" if not soft else "Suggested (Soft)"
-                        assignments.append(ScheduleEntry(b["block_id"], cl.client_id, cg.caregiver_id, day, b["start"], b["end"], status))
-                        add_assignment(cg, day, s, e, cl.client_id)
-                        placed=True; break
-                    else:
-                        # pair both blocks with same caregiver
-                        b22, b00 = night_pair[(cl.client_id, day)]
-                        if b["block_id"] == b22["block_id"]:
-                            s22,e22 = time_to_slot(b22["start"]), time_to_slot(b22["end"])
-                            s00,e00 = time_to_slot(b00["start"]), time_to_slot(b00["end"])
-                        else:
-                            s22,e22 = time_to_slot(b22["start"]), time_to_slot(b22["end"])
-                            s00,e00 = time_to_slot(b00["start"]), time_to_slot(b00["end"])
-                        ok1, err1, soft1 = can_place_single(cg, cl_city, day, s22, e22)
-                        ok2, err2, soft2 = can_place_single(cg, cl_city, day, s00, e00)
-                        if ok1 and ok2:
-                            status = "Assigned" if not (soft1 or soft2) else "Suggested (Soft)"
-                            assignments.append(ScheduleEntry(b22["block_id"], cl.client_id, cg.caregiver_id, day, b22["start"], b22["end"], status))
-                            assignments.append(ScheduleEntry(b00["block_id"], cl.client_id, cg.caregiver_id, day, b00["start"], b00["end"], status))
-                            add_assignment(cg, day, s22, e22, cl.client_id)
-                            add_assignment(cg, day, s00, e00, cl.client_id)
-                            used_block_ids.add(b22["block_id"]); used_block_ids.add(b00["block_id"])
-                            placed=True; break
-                        else:
-                            local_excs.append((cg.caregiver_id, "Night pairing"))
-                            continue
+                    ok, err, soft = can_place_single(cg, cl_city, day, s, e)
+                    if not ok:
+                        local_excs.append((cg.caregiver_id, err or "Constraint")); continue
+                    status = "Assigned" if not soft else "Suggested (Soft)"
+                    assignments.append(ScheduleEntry(b["block_id"], cl.client_id, cg.caregiver_id, day, b["start"], b["end"], status))
+                    add_assignment(cg, day, s, e, cl.client_id)
+                    placed=True; break
 
                 if not placed:
-                    # record up to 5 exception options
                     used=set()
                     for cg_id, ex_type in local_excs:
                         if cg_id in used: continue
@@ -1006,7 +979,7 @@ with tabs[1]:
             cur_24 = (str(cur_24.iloc[0]).strip().lower() in ("true","1","t","yes","y")) if len(cur_24)>0 else False
             cur_skip = dfs["clients"].loc[dfs["clients"]["Name"]==sel, "SkipForWeek"]
             cur_skip = (str(cur_skip.iloc[0]).strip().lower() in ("true","1","t","yes","y")) if len(cur_skip)>0 else False
-            c24 = st.checkbox("24-Hour Client", value=cur_24, key=f"c24_{sel}")
+            c24 = st.checkbox("24-Hour Client (daytime only for now: 07:00–22:00)", value=cur_24, key=f"c24_{sel}")
             skip_val = st.checkbox("Skip for the week", value=cur_skip, key=f"skip_client_{sel}")
             if st.button("Save 24-Hour / Skip flags for client"):
                 dfc = dfs["clients"].copy()
@@ -1076,7 +1049,7 @@ with tabs[2]:
             "iteration": st.session_state["solver_iters"],
             "score": result.diagnostics.get("score",0.0),
             "timestamp": datetime.now().isoformat(),
-            "notes": "day-by-day RR + night-pair"
+            "notes": "daytime-only 24h"
         }])], ignore_index=True)
         save_csv_safe(ITER_LOG_FILE, it_df)
         dfs = load_ui_csvs()
