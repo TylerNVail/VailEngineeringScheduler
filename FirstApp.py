@@ -1,13 +1,11 @@
-# FirstApp.py — ClearConnect (v-next)
-# Key updates:
-# - Fix 24-hour splitter (00:00–07:00 preserved; night edges honored)
-# - Day-by-day, preference-first round-robin solver with randomized start day
-# - Flex "Consecutive Days (True | False)" supported + enforced
-# - Default iterations = 100
-# - 15-min grid (96 rows) kept; zebra striping applied to ALL tables (dataframe + data_editor) via CSS
-# - Dropdowns & core profile grids alphabetized
-# - Human-readable exceptions retained
-# - Weekly/daily hour prefs & travel rules from last build intact
+# FirstApp.py — ClearConnect (v-next2)
+# Fixes:
+# 1) 24h clients assign (paired-night placement enforced)
+# 2) Sort names by last name across UI
+# 3) Zebra rows for core profile editors
+# 4) True deletion: purge orphans on save
+# 5) 22:00–24:00 and 00:00–07:00 must be same caregiver (hard)
+# 6) Default iterations = 500
 
 import streamlit as st
 import pandas as pd
@@ -25,6 +23,7 @@ st.markdown(
       .block-container { max-width: 100% !important; padding-left: 1.5rem; padding-right: 1.5rem; }
       .app-title { text-align:center; font-size: 38px; font-weight: 700; margin: .5rem 0 1rem 0; }
       .app-footer { text-align:center; color:#666; padding: 1rem 0 0.5rem 0; }
+
       /* Zebra striping for ALL tables (dataframe + data_editor) */
       [data-testid="stDataFrame"] table tbody tr:nth-child(even),
       [data-testid="stDataEditor"] table tbody tr:nth-child(even) { background-color: #f5fbff !important; }
@@ -66,7 +65,6 @@ def ensure_ui_csvs():
     ensure_csv(CAREGIVER_FILE, ["Name","Base Location","Notes","SkipForWeek","Min Hours (week)","Max Hours (week)","AsManyHours"])
     ensure_csv(CAREGIVER_AVAIL_FILE, ["Caregiver Name","Day","Start","End","Availability Type","Notes"])
     ensure_csv(CLIENT_FILE, ["Name","Base Location","Importance","Scheduling Mode","Preferred Caregivers","Not Permitted Caregivers","Notes","24_Hour","SkipForWeek"])
-    # Add Consecutive Days in flex
     ensure_csv(CLIENT_FIXED_FILE, ["Client Name","Day","Start","End","SkipForWeek","Notes"])
     ensure_csv(CLIENT_FLEX_FILE, ["Client Name","Length (hrs)","Number of Shifts","Start Day","End Day","Start Time","End Time","Consecutive Days","SkipForWeek","Notes"])
     ensure_csv(APPROVALS_FILE, ["approval_id","client_name","caregiver_name","day","start","end","constraint_type","decision","timestamp","notes"])
@@ -74,7 +72,6 @@ def ensure_ui_csvs():
     ensure_csv(MANUAL_SHIFTS_FILE, ["Client Name","Caregiver Name","Day","Start","End"])
     if not os.path.exists(BEST_SOLUTION_FILE):
         pd.DataFrame(columns=["block_id","client_id","caregiver_id","day","start_time","end_time","assignment_status"]).to_csv(BEST_SOLUTION_FILE, index=False)
-
 ensure_ui_csvs()
 
 def load_ui_csvs():
@@ -89,16 +86,15 @@ def load_ui_csvs():
         "manual": load_csv_safe(MANUAL_SHIFTS_FILE, ["Client Name","Caregiver Name","Day","Start","End"]),
         "best": pd.read_csv(BEST_SOLUTION_FILE, dtype=str).fillna(""),
     }
-
 dfs = load_ui_csvs()
 
 # Defaults
 if "solver_iters" not in st.session_state:
-    st.session_state["solver_iters"] = 100     # default 100 per your request
+    st.session_state["solver_iters"] = 500   # default 500
 if "solver_time" not in st.session_state:
     st.session_state["solver_time"] = 10
 
-# ---------------- Constants / helpers ----------------
+# ---------------- Utilities ----------------
 DAYS_FULL = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
 DAY_SHORT = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
 UI_TO_SHORT = dict(zip(DAYS_FULL, DAY_SHORT))
@@ -115,20 +111,10 @@ def parse_time_to_minutes(t:str)->int:
     if t == "24:00": return 24*60
     h,m = map(int, t.split(":")); return h*60+m
 
-def time_to_slot(t:str)->int:
-    return parse_time_to_minutes(t)//15
-
+def time_to_slot(t:str)->int: return parse_time_to_minutes(t)//15
 def slot_to_time(s:int)->str:
     m = s*15
     return "24:00" if m>=24*60 else f"{m//60:02d}:{m%60:02d}"
-
-def ensure_min_rows(df, n, defaults):
-    if df is None or df.empty:
-        df = pd.DataFrame(columns=list(defaults.keys()))
-    if len(df) < n:
-        add = n - len(df)
-        df = pd.concat([df, pd.DataFrame([defaults.copy() for _ in range(add)])], ignore_index=True)
-    return df.reset_index(drop=True)
 
 def drop_empty_rows(df):
     if df is None or df.empty: return pd.DataFrame(columns=df.columns)
@@ -139,11 +125,12 @@ def do_rerun():
     if hasattr(st, "rerun"): st.rerun()
     elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
-def stripe_rows(df: pd.DataFrame):
-    # (kept for any place we still use Styler)
-    styles = pd.DataFrame('', index=df.index, columns=df.columns)
-    styles.iloc[::2, :] = 'background-color: #f5fbff'
-    return df.style.apply(lambda _df: styles, axis=None)
+def sort_by_last_name(names:List[str])->List[str]:
+    def key(n):
+        n = (n or "").strip()
+        parts = n.split()
+        return (parts[-1].lower(), n.lower()) if parts else ("", "")
+    return sorted(names, key=key)
 
 # ---------------- Domain ----------------
 @dataclass
@@ -157,7 +144,7 @@ class Caregiver:
     availability: Dict[str, List[Dict]] = field(default_factory=dict)
     notes: str = ""
     work_log: Dict[str, List[Tuple[int,int,str]]] = field(default_factory=lambda: defaultdict(list))
-    daily_city_trips: Dict[str, int] = field(default_factory=lambda: defaultdict(int))  # PC crossings only
+    daily_city_trips: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
 @dataclass
 class Client:
@@ -199,29 +186,26 @@ class SolverResult:
     pending_exceptions: List[ExceptionOption]
     diagnostics: Dict = field(default_factory=dict)
 
-# ---------------- Travel / rules ----------------
+# ---------------- Rules helpers ----------------
 def travel_buffer_mins(city_a:str, city_b:str)->int:
     if not city_a or not city_b or city_a==city_b: return 30
     pair = {city_a, city_b}
     if pair == {"Paradise","Chico"}: return 30
-    return 60  # Any Oroville crossing
+    return 60
 
-def is_pc(a,b)->bool:
-    return {a,b} == {"Paradise","Chico"}
+def is_pc(a,b)->bool: return {a,b} == {"Paradise","Chico"}
 
 def travel_exception_type(city_a:str, city_b:str, pc_crossings_today:int)->Optional[str]:
-    if not city_a or not city_b or city_a==city_b:
-        return None
+    if not city_a or not city_b or city_a==city_b: return None
     pair = {city_a, city_b}
-    if "Oroville" in pair:
-        return "Travel Oroville"
-    if pair == {"Paradise","Chico"} and pc_crossings_today >= 1:
-        return "Paradise↔Chico (2nd+)"
+    if "Oroville" in pair: return "Travel Oroville"
+    if pair == {"Paradise","Chico"} and pc_crossings_today >= 1: return "Paradise↔Chico (2nd+)"
     return None
 
-# ---------------- Availability / overlaps / hours ----------------
-DAILY_AUTO_LIMIT_MIN = 9*60       # >9h/day -> exception
-AS_MANY_WEEK_CAP_MIN = 50*60      # >50h/week (as-many) -> exception
+DAILY_AUTO_LIMIT_MIN = 9*60
+AS_MANY_WEEK_CAP_MIN = 50*60
+NIGHT_START = time_to_slot("22:00")
+NIGHT_END   = time_to_slot("07:00")
 
 def is_available(cg:Caregiver, day_full:str, start:str, end:str)->Tuple[bool,bool]:
     day_short = UI_TO_SHORT.get(day_full, day_full)
@@ -246,7 +230,7 @@ def would_break_day_off(cg:Caregiver, day_full:str, start_slot:int, end_slot:int
     days_worked = {d for d,blocks in cg.work_log.items() if blocks}
     prospective = set(days_worked)
     if start_slot < end_slot: prospective.add(day_full)
-    return len(prospective) > 6  # must keep ≥1 day off
+    return len(prospective) > 6
 
 def has_overlap(cg:Caregiver, day:str, start_slot:int, end_slot:int)->bool:
     for (s,e,_) in cg.work_log.get(day, []):
@@ -255,31 +239,23 @@ def has_overlap(cg:Caregiver, day:str, start_slot:int, end_slot:int)->bool:
     return False
 
 def current_daily_minutes(cg:Caregiver, day:str)->int:
-    mins=0
-    for s,e,_ in cg.work_log.get(day, []):
-        mins += (e-s)*15
-    return mins
+    return sum((e-s)*15 for s,e,_ in cg.work_log.get(day, []))
 
 def current_week_minutes(cg:Caregiver)->int:
-    mins=0
-    for day, blocks in cg.work_log.items():
-        for s,e,_ in blocks:
-            mins += (e-s)*15
-    return mins
+    return sum((e-s)*15 for d in cg.work_log for s,e,_ in cg.work_log[d])
 
-# ---------------- Gaps / scoring ----------------
 _city_lookup: Dict[str,str] = {}
 def cl_city_for(client_id:str)->str: return _city_lookup.get(client_id, "")
 
-def client_gap_score(day_blocks:List[Tuple[int,int]])->int:
-    day_blocks = sorted(day_blocks)
-    score = 0
-    for i in range(1, len(day_blocks)):
-        gap = day_blocks[i][0] - day_blocks[i-1][1]
-        if gap <= 2: score += 10       # ≤30m
-        elif gap <= 4: score += 5      # ≤60m
-        else: score += 1
-    return score
+def week_hour_pref_penalty(cg:Caregiver)->float:
+    mins = current_week_minutes(cg); hrs = mins/60.0
+    if cg.as_many_hours:
+        return 0.5*max(0.0, hrs-50)
+    lo = cg.min_week_hours or 0.0; hi = cg.max_week_hours or 0.0
+    if lo==0 and hi==0: return 0.0
+    if hi and hrs>hi: return (hrs-hi) * 0.8
+    if lo and hrs<lo: return (lo-hrs) * 0.3
+    return 0.0
 
 def per_caregiver_city_changes(assignments:List[ScheduleEntry])->int:
     changes = 0
@@ -294,24 +270,20 @@ def per_caregiver_city_changes(assignments:List[ScheduleEntry])->int:
                     changes += 1
     return changes
 
-def week_hour_pref_penalty(cg:Caregiver)->float:
-    mins = current_week_minutes(cg)
-    hrs = mins/60.0
-    if cg.as_many_hours:
-        return 0.5*max(0.0, hrs-50)
-    lo = cg.min_week_hours or 0.0
-    hi = cg.max_week_hours or 0.0
-    if lo==0 and hi==0: return 0.0
-    if hi and hrs>hi:
-        return (hrs-hi) * 0.8
-    if lo and hrs<lo:
-        return (lo-hrs) * 0.3
-    return 0.0
+def client_gap_score(day_blocks:List[Tuple[int,int]])->int:
+    day_blocks = sorted(day_blocks)
+    score = 0
+    for i in range(1, len(day_blocks)):
+        gap = day_blocks[i][0] - day_blocks[i-1][1]
+        if gap <= 2: score += 10       # ≤30m
+        elif gap <= 4: score += 5      # ≤60m
+        else: score += 1
+    return score
 
 def score_solution(assignments:List[ScheduleEntry], client_priority:Dict[str,int], cg_map:Dict[str,"Caregiver"])->float:
     score = 0.0
     for a in assignments:
-        dur = (time_to_slot(a.end_time)-time_to_slot(a.start_time))*0.25  # hours
+        dur = (time_to_slot(a.end_time)-time_to_slot(a.start_time))*0.25
         pr = client_priority.get(a.client_id,0)
         score += dur * (1 + pr/10.0)
         if "Suggested" in a.assignment_status:
@@ -327,31 +299,22 @@ def score_solution(assignments:List[ScheduleEntry], client_priority:Dict[str,int
         score -= week_hour_pref_penalty(cg)
     return score
 
-# ---------------- Splitter (fixed) — preserves night segments ----------------
-NIGHT_START = time_to_slot("22:00")  # 88
-NIGHT_END   = time_to_slot("07:00")  # 28
-
+# ---------------- Split fixed into chunks (keeps 00–07 and 22–24) ----------------
 def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
-    """Split into ~6–8h chunks, but never lose 00:00–07:00 or 22:00–24:00 coverage."""
     s = time_to_slot(start); e = time_to_slot(end)
     if e<=s: return []
     chunks=[]
-    # Always include night-edge chunks if overlapped
-    if s < NIGHT_END:
-        ns = s
-        ne = min(e, NIGHT_END)
+    if s < NIGHT_END:  # 00:00–07:00
+        ns = s; ne = min(e, NIGHT_END)
         if ns < ne: chunks.append((ns, ne))
         s = max(s, NIGHT_END)
-    # mid-day stretch
-    while s < min(e, NIGHT_START):
+    while s < min(e, NIGHT_START):  # 07:00–22:00
         cut = min(NIGHT_START, s + random.randint(24, 32))  # 6–8h
         cut = min(cut, e)
         chunks.append((s, cut))
         s = cut
-    # night-end chunk if needed
-    if e > NIGHT_START:
-        ns = max(s, NIGHT_START)
-        ne = e
+    if e > NIGHT_START:  # 22:00–24:00
+        ns = max(s, NIGHT_START); ne = e
         if ns < ne: chunks.append((ns, ne))
     # merge touching
     merged=[]
@@ -361,10 +324,9 @@ def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
         else: merged.append(seg)
     return [(slot_to_time(x[0]), slot_to_time(x[1])) for x in merged]
 
-# ---------------- Build blocks ----------------
+# ---------------- Build client blocks ----------------
 def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
-    blocks = []
-    flex_specs = []
+    blocks = []; flex_specs = []
     for c in clients:
         for req in c.requests:
             if req.get("type") == "fixed":
@@ -393,18 +355,14 @@ def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
 
 def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random)->List[Dict]:
     placed=[]
-    # map day index for spacing rules
     d2i = {d:i for i,d in enumerate(DAYS_FULL)}
     for spec in flex_specs:
         dur_slots = int(round(spec["duration"]*4))
         ws = time_to_slot(spec["window_start"]); we = time_to_slot(spec["window_end"])
-        allowed_days = [d for d in spec["days"]]
-        rng.shuffle(allowed_days)
-        want = int(spec["blocks"]); used_days=[]
-        tries=0
+        allowed_days = list(spec["days"]); rng.shuffle(allowed_days)
+        want = int(spec["blocks"]); used_days=[]; tries=0
         def ok_gap(newd):
             if spec["consecutive"]: return True
-            # need ≥1 day gap to nearest used day
             ni = d2i[newd]
             return all(min((ni - d2i[u]) % 7, (d2i[u] - ni) % 7) >= 2 for u in used_days)
         while want>0 and tries<600:
@@ -415,10 +373,8 @@ def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random)->List[D
             valids=[]
             for s in range(ws, max(ws, we - dur_slots) + 1):
                 e = s + dur_slots
-                if not (NIGHT_END <= s < NIGHT_START):  # 07:00..22:00
-                    continue
-                if not (NIGHT_END < e <= 96):
-                    continue
+                if not (NIGHT_END <= s < NIGHT_START): continue   # 07–22 start
+                if not (NIGHT_END < e <= 96): continue
                 valids.append(s)
             rng.shuffle(valids)
             if not valids: continue
@@ -435,7 +391,7 @@ def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random)->List[D
             used_days.append(d); want -= 1
     return placed
 
-# ---------------- Travel / add assignment ----------------
+# ---------------- Travel / adjacency ----------------
 def travel_buffer_slots(city_a:str, city_b:str)->int:
     return travel_buffer_mins(city_a, city_b)//15
 
@@ -446,18 +402,14 @@ def will_violate_travel(cg:Caregiver, day:str, start_slot:int, end_slot:int, new
         if e <= start_slot: left=(s,e,clid)
         if s >= end_slot and right is None: right=(s,e,clid)
     if left:
-        ls, le, lclid = left
-        lcity = cl_city_for(lclid)
-        gap = start_slot - le
-        buf = travel_buffer_slots(lcity, new_city)
+        ls, le, lclid = left; lcity = cl_city_for(lclid)
+        gap = start_slot - le; buf = travel_buffer_slots(lcity, new_city)
         if gap < buf: return (True, "Travel buffer")
         ex = travel_exception_type(lcity, new_city, cg.daily_city_trips.get(day,0))
         if ex: return (True, ex)
     if right:
-        rs, re, rclid = right
-        rcity = cl_city_for(rclid)
-        gap = rs - end_slot
-        buf = travel_buffer_slots(new_city, rcity)
+        rs, re, rclid = right; rcity = cl_city_for(rclid)
+        gap = rs - end_slot; buf = travel_buffer_slots(new_city, rcity)
         if gap < buf: return (True, "Travel buffer")
         ex = travel_exception_type(new_city, rcity, cg.daily_city_trips.get(day,0))
         if ex: return (True, ex)
@@ -477,12 +429,11 @@ def add_assignment(cg:Caregiver, day:str, start_slot:int, end_slot:int, client_i
         if is_pc(cl_city_for(rclid), cl_city_for(client_id)):
             cg.daily_city_trips[day] += 1
 
-# ---------------- Exceptions persistence ----------------
+# ---------------- Exceptions CSV (human-readable) ----------------
 def append_pending_exceptions_to_csv(pending:List[ExceptionOption]):
     if not pending: return
     exist = load_ui_csvs()["approvals"]
     keys_existing = set((r["client_name"], r["caregiver_name"], r["day"], r["start"], r["end"], r["constraint_type"]) for _,r in exist.iterrows())
-    new_rows=[]
     friendly = {
         "Travel buffer": "not enough travel time between adjacent assignments",
         "Travel Oroville": "Oroville crossing requires approval",
@@ -492,7 +443,9 @@ def append_pending_exceptions_to_csv(pending:List[ExceptionOption]):
         "Unavailable": "caregiver not available for the entire block",
         "Daily hours >9": "would push daily total above 9 hours",
         "Weekly hours >50 (as-many)": "would push weekly total above 50 hours (as-many-hours cap)",
+        "Night pairing": "night segments 22:00–24:00 and 00:00–07:00 must be the same caregiver",
     }
+    new_rows=[]
     for ex in pending:
         key = (ex.client_id, ex.caregiver_id, ex.day, ex.start_time, ex.end_time, ex.exception_type)
         if key in keys_existing: continue
@@ -514,11 +467,12 @@ def append_pending_exceptions_to_csv(pending:List[ExceptionOption]):
         updated = pd.concat([exist, pd.DataFrame(new_rows)], ignore_index=True)
         save_csv_safe(APPROVALS_FILE, updated)
 
-# ---------------- Build objects ----------------
+# ---------------- Build objects from CSVs ----------------
 def build_client_objects_from_dfs(dfs):
     clients=[]
-    # Alphabetize for UI consistency
-    clients_rows = dfs["clients"].sort_values("Name", kind="stable")
+    clients_rows = dfs["clients"].copy()
+    clients_rows["__sort"] = clients_rows["Name"].apply(lambda n: (n.split()[-1].lower(), n.lower()) if isinstance(n,str) and n.strip() else ("", ""))
+    clients_rows = clients_rows.sort_values(["__sort"], kind="stable").drop(columns=["__sort"])
     for _, r in clients_rows.iterrows():
         if str(r.get("SkipForWeek","")).strip().lower() in ("true","1","t","yes","y"): continue
         reqs=[]
@@ -562,7 +516,9 @@ def build_client_objects_from_dfs(dfs):
 
 def build_caregiver_objects_from_dfs(dfs):
     caregivers=[]
-    rows = dfs["caregivers"].sort_values("Name", kind="stable")
+    rows = dfs["caregivers"].copy()
+    rows["__sort"] = rows["Name"].apply(lambda n: (n.split()[-1].lower(), n.lower()) if isinstance(n,str) and n.strip() else ("", ""))
+    rows = rows.sort_values(["__sort"], kind="stable").drop(columns=["__sort"])
     for _, r in rows.iterrows():
         if str(r.get("SkipForWeek","")).strip().lower() in ("true","1","t","yes","y"): continue
         name = r["Name"]
@@ -582,7 +538,7 @@ def build_caregiver_objects_from_dfs(dfs):
         ))
     return caregivers
 
-# ---------------- Uncovered computation ----------------
+# ---------------- Uncovered overlays ----------------
 def compute_all_requested_blocks(clients:List[Client]):
     fixed_blocks, flex_specs = expand_client_requests(clients)
     return fixed_blocks, flex_specs
@@ -593,10 +549,8 @@ def representative_slot_for_flex(spec)->Optional[Tuple[str,str,str]]:
     for d in spec["days"]:
         for s in range(ws, max(ws, we - dur_slots) + 1):
             e = s + dur_slots
-            if not (NIGHT_END <= s < NIGHT_START):  # 07:00..22:00
-                continue
-            if not (NIGHT_END < e <= 96):
-                continue
+            if not (NIGHT_END <= s < NIGHT_START): continue
+            if not (NIGHT_END < e <= 96): continue
             return d, slot_to_time(s), slot_to_time(e)
     return None
 
@@ -635,7 +589,7 @@ def compute_uncovered(dfs)->Tuple[pd.DataFrame, Dict[str, List[Dict]]]:
         per_client_unfilled[f["client_id"]].append({"day": f["day"], "start": f["start"], "end": f["end"], "label": "Not covered (F)"})
     return mat, per_client_unfilled
 
-# ---------------- Solver (day-by-day, preference-first round robin) ----------------
+# ---------------- Solver with paired night placement ----------------
 def solve_week(
     caregivers:List[Caregiver],
     clients:List[Client],
@@ -669,123 +623,153 @@ def solve_week(
 
     rng = random.Random(random_seed)
     fixed_blocks, flex_specs = expand_client_requests(clients)
-    # generate a flex plan per iteration
     pr_map = {c.client_id: c.priority for c in clients}
     client_map = {c.client_id: c for c in clients}
     cg_map = {c.caregiver_id: c for c in caregivers}
 
-    # ---- Organize blocks by day ----
+    # compose blocks
     all_blocks = fixed_blocks + place_flex_blocks_one_plan(flex_specs, rng)
-    # keep un-locked ones only; locks handled separately
-    blocks_by_day = defaultdict(list)
-    lock_keys = set((clid, d, st, en) for (clid, d, st, en, _, _) in locks)
-    for b in all_blocks:
-        key=(b["client_id"], b["day"], b["start"], b["end"])
-        if key in lock_keys: continue
-        blocks_by_day[b["day"]].append(b)
 
-    # round-robin helpers
-    def blocks_for_day_rounds(day):
+    # Index blocks by day + (client,start,end) for night pairing
+    blocks_by_day = defaultdict(list)
+    idx_by_key = {}
+    for b in all_blocks:
+        blocks_by_day[b["day"]].append(b)
+        idx_by_key[(b["client_id"], b["day"], b["start"], b["end"])] = b
+
+    # Remove any that are locked; we’ll force-place locks first
+    lock_keys = set((clid, d, st, en) for (clid, d, st, en, _, _) in locks)
+    for day in DAYS_FULL:
+        blocks_by_day[day] = [b for b in blocks_by_day[day] if (b["client_id"], b["day"], b["start"], b["end"]) not in lock_keys]
+
+    # round-robin order within a day
+    def day_round_order(day):
         blocks = blocks_by_day.get(day, [])
-        # split into preferred vs non-preferred
         pref = defaultdict(list); nonpref = defaultdict(list)
         for b in blocks:
             cl = client_map[b["client_id"]]
-            has_pref = len(cl.top_caregivers)>0
-            (pref if has_pref else nonpref)[cl.client_id].append(b)
-        # within each client bucket, sort by earliest start
+            (pref if cl.top_caregivers else nonpref)[cl.client_id].append(b)
         for dct in (pref, nonpref):
             for cid in dct:
                 dct[cid].sort(key=lambda x: time_to_slot(x["start"]))
-        # order clients by Importance desc
-        imp_sorted_pref = sorted(pref.keys(), key=lambda cid: -client_map[cid].priority)
-        imp_sorted_non  = sorted(nonpref.keys(), key=lambda cid: -client_map[cid].priority)
-        # yield blocks in passes: one per client each pass
         order=[]
-        while any(pref.values()):
-            for cid in imp_sorted_pref:
-                if pref[cid]:
-                    order.append(pref[cid].pop(0))
-        while any(nonpref.values()):
-            for cid in imp_sorted_non:
-                if nonpref[cid]:
-                    order.append(nonpref[cid].pop(0))
+        for bucket in (pref, nonpref):
+            keys = sorted(bucket.keys(), key=lambda cid: -client_map[cid].priority)
+            while any(bucket.values()):
+                for cid in keys:
+                    if bucket[cid]:
+                        order.append(bucket[cid].pop(0))
         return order
 
     best_assignments=[]; best_exceptions=[]; best_score=None
 
     for it in range(max(1, int(iterations))):
         rng.seed(random_seed + it*7919)
-        # reset caregivers
         for cg in caregivers:
             cg.work_log = defaultdict(list); cg.daily_city_trips = defaultdict(int)
 
         assignments=[]; exceptions=[]
 
-        def force_place(client_id, day, start, end, caregiver_id, status="Assigned (Approved/Locked)"):
-            cg = cg_map.get(caregiver_id)
+        def can_place_single(cg:Caregiver, cl_city:str, day:str, s:int, e:int)->Tuple[bool, Optional[str], bool]:
+            hard_ok, soft_prefer = is_available(cg, day, slot_to_time(s), slot_to_time(e))
+            if not hard_ok: return (False, "Unavailable", soft_prefer)
+            if would_break_day_off(cg, day, s, e): return (False, "Day off", soft_prefer)
+            if has_overlap(cg, day, s, e): return (False, "Overlap", soft_prefer)
+            if current_daily_minutes(cg, day) + (e-s)*15 > DAILY_AUTO_LIMIT_MIN: return (False, "Daily hours >9", soft_prefer)
+            if cg.as_many_hours and (current_week_minutes(cg) + (e-s)*15 > AS_MANY_WEEK_CAP_MIN): return (False, "Weekly hours >50 (as-many)", soft_prefer)
+            violates, ex_type = will_violate_travel(cg, day, s, e, cl_city)
+            if violates: return (False, ex_type or "Travel", soft_prefer)
+            return (True, None, soft_prefer)
+
+        def force_place(clid, day, st, en, caregiver_id, status="Assigned (Approved/Locked)"):
+            cg = cg_map.get(caregiver_id); 
             if not cg: return False
-            s = time_to_slot(start); e=time_to_slot(end)
-            # overlap / daily / weekly gates
-            if has_overlap(cg, day, s, e):
-                exceptions.append(ExceptionOption(f"E_{uuid.uuid4().hex[:8]}", client_id, caregiver_id, day, start, end, "Overlap", {})); return False
-            if current_daily_minutes(cg, day) + (e-s)*15 > 9*60:
-                exceptions.append(ExceptionOption(f"E_{uuid.uuid4().hex[:8]}", client_id, caregiver_id, day, start, end, "Daily hours >9", {})); return False
-            if cg.as_many_hours and (current_week_minutes(cg) + (e-s)*15 > 50*60):
-                exceptions.append(ExceptionOption(f"E_{uuid.uuid4().hex[:8]}", client_id, caregiver_id, day, start, end, "Weekly hours >50 (as-many)", {})); return False
-            assignments.append(ScheduleEntry(f"B_{uuid.uuid4().hex[:8]}", client_id, caregiver_id, day, start, end, status))
-            add_assignment(cg, day, s, e, client_id)
+            s=time_to_slot(st); e=time_to_slot(en); cl_city = cl_city_for(clid)
+            ok, err, _ = can_place_single(cg, cl_city, day, s, e)
+            if not ok:
+                exceptions.append(ExceptionOption(f"E_{uuid.uuid4().hex[:8]}", clid, caregiver_id, day, st, en, err or "Constraint", {})); 
+                return False
+            assignments.append(ScheduleEntry(f"B_{uuid.uuid4().hex[:8]}", clid, caregiver_id, day, st, en, status))
+            add_assignment(cg, day, s, e, clid)
             return True
 
-        # apply locks and approvals
+        # apply locks and approvals first
         for clid, day, stt, enn, cg_id, label in locks:
             force_place(clid, day, stt, enn, cg_id, status=label)
         for (clid, day, stt, enn, cg_id) in approved_overrides:
             if any(a.client_id==clid and a.day==day and a.start_time==stt and a.end_time==enn for a in assignments): continue
             force_place(clid, day, stt, enn, cg_id, status="Assigned (Approved)")
 
-        # randomized start day, then work through all 7 days
-        day_order = DAYS_FULL[:]
-        rng.shuffle(day_order)
+        # work days in randomized order
+        day_order = DAYS_FULL[:]; rng.shuffle(day_order)
 
         for day in day_order:
-            day_seq = blocks_for_day_rounds(day)
-            for b in day_seq:
-                cl = client_map[b["client_id"]]
-                start=b["start"]; end=b["end"]; s=time_to_slot(start); e=time_to_slot(end)
-                cl_city = cl.base_location
+            seq = day_round_order(day)
+            # Build fast lookup of night pair for this day per client
+            # pair: 22:00–24:00 with 00:00–07:00 (same day)
+            night_pair = {}
+            key_2200 = {}
+            key_0000 = {}
+            for b in seq:
+                s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
+                if s < NIGHT_END and e <= NIGHT_END: key_0000[(b["client_id"], day)] = b
+                if s >= NIGHT_START: key_2200[(b["client_id"], day)] = b
+            for k in key_2200:
+                if k in key_0000:
+                    night_pair[k] = (key_2200[k], key_0000[k])
 
-                # build candidate caregivers list: preferred first if applicable, same-city first
+            used_block_ids=set()
+
+            for b in seq:
+                if b["block_id"] in used_block_ids: continue
+                cl = client_map[b["client_id"]]; cl_city = cl.base_location
+                s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
+                want_pair = (b["client_id"], day) in night_pair and (time_to_slot(b["start"])>=NIGHT_START or time_to_slot(b["end"])<=NIGHT_END)
+
+                # candidates ordered: last-name sort already used in building lists; here we sort by preference & city
                 cand = [c for c in caregivers if c.caregiver_id not in cl.banned_caregivers]
-                # give preference if client has top caregivers
                 cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
-                # then sort by same city
                 cand.sort(key=lambda cg: 0 if cg.base_location==cl_city else 1)
 
                 placed=False; local_excs=[]
-                for cg in cand:
-                    if (cl.client_id, day, start, end, cg.caregiver_id) in declined_blacklist:
-                        local_excs.append((cg.caregiver_id, "Declined earlier")); continue
-                    hard_ok, soft_prefer = is_available(cg, day, start, end)
-                    if not hard_ok: local_excs.append((cg.caregiver_id, "Unavailable")); continue
-                    if would_break_day_off(cg, day, s, e): local_excs.append((cg.caregiver_id, "Day off")); continue
-                    if has_overlap(cg, day, s, e): local_excs.append((cg.caregiver_id, "Overlap")); continue
-                    if current_daily_minutes(cg, day) + (e-s)*15 > 9*60:
-                        local_excs.append((cg.caregiver_id, "Daily hours >9")); continue
-                    if cg.as_many_hours and (current_week_minutes(cg) + (e-s)*15 > 50*60):
-                        local_excs.append((cg.caregiver_id, "Weekly hours >50 (as-many)")); continue
-                    violates, ex_type = will_violate_travel(cg, day, s, e, cl_city)
-                    if violates: local_excs.append((cg.caregiver_id, ex_type or "Travel")); continue
 
-                    status = "Assigned" if not soft_prefer else "Suggested (Soft)"
-                    assignments.append(ScheduleEntry(
-                        block_id=b["block_id"], client_id=cl.client_id, caregiver_id=cg.caregiver_id,
-                        day=day, start_time=start, end_time=end, assignment_status=status
-                    ))
-                    add_assignment(cg, day, s, e, cl.client_id)
-                    placed=True; break
+                for cg in cand:
+                    if (cl.client_id, day, b["start"], b["end"], cg.caregiver_id) in declined_blacklist:
+                        local_excs.append((cg.caregiver_id, "Declined earlier")); continue
+
+                    if not want_pair:
+                        ok, err, soft = can_place_single(cg, cl_city, day, s, e)
+                        if not ok:
+                            local_excs.append((cg.caregiver_id, err or "Constraint")); continue
+                        status = "Assigned" if not soft else "Suggested (Soft)"
+                        assignments.append(ScheduleEntry(b["block_id"], cl.client_id, cg.caregiver_id, day, b["start"], b["end"], status))
+                        add_assignment(cg, day, s, e, cl.client_id)
+                        placed=True; break
+                    else:
+                        # pair both blocks with same caregiver
+                        b22, b00 = night_pair[(cl.client_id, day)]
+                        if b["block_id"] == b22["block_id"]:
+                            s22,e22 = time_to_slot(b22["start"]), time_to_slot(b22["end"])
+                            s00,e00 = time_to_slot(b00["start"]), time_to_slot(b00["end"])
+                        else:
+                            s22,e22 = time_to_slot(b22["start"]), time_to_slot(b22["end"])
+                            s00,e00 = time_to_slot(b00["start"]), time_to_slot(b00["end"])
+                        ok1, err1, soft1 = can_place_single(cg, cl_city, day, s22, e22)
+                        ok2, err2, soft2 = can_place_single(cg, cl_city, day, s00, e00)
+                        if ok1 and ok2:
+                            status = "Assigned" if not (soft1 or soft2) else "Suggested (Soft)"
+                            assignments.append(ScheduleEntry(b22["block_id"], cl.client_id, cg.caregiver_id, day, b22["start"], b22["end"], status))
+                            assignments.append(ScheduleEntry(b00["block_id"], cl.client_id, cg.caregiver_id, day, b00["start"], b00["end"], status))
+                            add_assignment(cg, day, s22, e22, cl.client_id)
+                            add_assignment(cg, day, s00, e00, cl.client_id)
+                            used_block_ids.add(b22["block_id"]); used_block_ids.add(b00["block_id"])
+                            placed=True; break
+                        else:
+                            local_excs.append((cg.caregiver_id, "Night pairing"))
+                            continue
 
                 if not placed:
+                    # record up to 5 exception options
                     used=set()
                     for cg_id, ex_type in local_excs:
                         if cg_id in used: continue
@@ -793,7 +777,7 @@ def solve_week(
                         exceptions.append(ExceptionOption(
                             exception_id=f"E_{uuid.uuid4().hex[:8]}",
                             client_id=cl.client_id, caregiver_id=cg_id, day=day,
-                            start_time=start, end_time=end, exception_type=ex_type or "Constraint", details={}
+                            start_time=b["start"], end_time=b["end"], exception_type=ex_type or "Constraint", details={}
                         ))
                         if len(used)>=5: break
 
@@ -808,7 +792,7 @@ def solve_week(
 
     return SolverResult(best_assignments, best_exceptions, diagnostics={"score": best_score or 0.0})
 
-# ---------------- Rendering helpers ----------------
+# ---------------- Render helpers ----------------
 def render_schedule_matrix(assignments_df:pd.DataFrame, mode:str, person:str)->pd.DataFrame:
     mat = pd.DataFrame(index=TIME_OPTS, columns=DAYS_FULL).fillna("")
     if assignments_df is None or assignments_df.empty or not person:
@@ -826,8 +810,7 @@ def render_schedule_matrix(assignments_df:pd.DataFrame, mode:str, person:str)->p
             mat.at[t, day] = (prev + " | " if prev else "") + txt
     return mat
 
-def empty_week_matrix():
-    return pd.DataFrame(index=TIME_OPTS, columns=DAYS_FULL).fillna("")
+def empty_week_matrix(): return pd.DataFrame(index=TIME_OPTS, columns=DAYS_FULL).fillna("")
 
 def manual_matrix_from_csv(dfs, client_name:str)->pd.DataFrame:
     mat = empty_week_matrix()
@@ -871,7 +854,9 @@ with tabs[0]:
 
     with cg_sub[0]:
         st.subheader("Caregiver List (core profile)")
-        cg_df = dfs["caregivers"].sort_values("Name", kind="stable").copy()
+        cg_df = dfs["caregivers"].copy()
+        cg_df["__sort"] = cg_df["Name"].apply(lambda n: (n.split()[-1].lower(), n.lower()) if isinstance(n,str) and n.strip() else ("", ""))
+        cg_df = cg_df.sort_values(["__sort"], kind="stable").drop(columns=["__sort"])
         edited = st.data_editor(
             cg_df,
             num_rows="dynamic",
@@ -890,23 +875,31 @@ with tabs[0]:
         if st.button("💾 Save Caregiver List"):
             cleaned = drop_empty_rows(edited)
             save_csv_safe(CAREGIVER_FILE, cleaned)
-            st.success("Caregiver list saved.")
-            dfs["caregivers"] = load_ui_csvs()["caregivers"]
+            # purge orphan availability
+            keep = set(cleaned["Name"].tolist())
+            avail = dfs["caregiver_avail"]
+            avail = avail[avail["Caregiver Name"].isin(keep)].reset_index(drop=True)
+            save_csv_safe(CAREGIVER_AVAIL_FILE, avail)
+            st.success("Caregiver list saved (and orphan availability purged).")
+            dfs = load_ui_csvs()
 
     with cg_sub[1]:
         st.subheader("Caregiver Availability")
-        cg_names = sorted(dfs["caregivers"]["Name"].tolist()) if not dfs["caregivers"].empty else []
+        cg_names = sort_by_last_name(dfs["caregivers"]["Name"].tolist()) if not dfs["caregivers"].empty else []
         sel = st.selectbox("Select Caregiver", options=[""]+cg_names, index=0, key="avail_select")
         if sel:
             cur = dfs["caregivers"].loc[dfs["caregivers"]["Name"]==sel, "SkipForWeek"]
             cur = (str(cur.iloc[0]).strip().lower() in ("true","1","t","yes","y")) if len(cur)>0 else False
             skip_val = st.checkbox("Skip for the week", value=cur, key=f"skip_cg_{sel}")
             if st.button("Save Skip flag for caregiver"):
-                dfs["caregivers"].loc[dfs["caregivers"]["Name"]==sel, "SkipForWeek"] = "True" if skip_val else "False"
-                save_csv_safe(CAREGIVER_FILE, dfs["caregivers"]); st.success("Skip flag saved."); dfs["caregivers"]=load_ui_csvs()["caregivers"]; do_rerun()
+                dfc = dfs["caregivers"].copy()
+                dfc.loc[dfc["Name"]==sel, "SkipForWeek"] = "True" if skip_val else "False"
+                save_csv_safe(CAREGIVER_FILE, dfc)
+                st.success("Skip flag saved."); dfs = load_ui_csvs(); do_rerun()
 
             sub_av = dfs["caregiver_avail"][dfs["caregiver_avail"]["Caregiver Name"]==sel].copy()
-            sub_av = ensure_min_rows(sub_av, 3, {"Caregiver Name": sel, "Day":"", "Start":"", "End":"", "Availability Type":"", "Notes":""})
+            if sub_av.empty:
+                sub_av = pd.DataFrame([{"Caregiver Name": sel, "Day":"", "Start":"", "End":"", "Availability Type":"", "Notes":""}])
             edited_av = st.data_editor(
                 sub_av,
                 num_rows="dynamic",
@@ -924,7 +917,7 @@ with tabs[0]:
             if st.button("💾 Save Availability for selected caregiver"):
                 rest = dfs["caregiver_avail"][dfs["caregiver_avail"]["Caregiver Name"]!=sel].copy()
                 save_csv_safe(CAREGIVER_AVAIL_FILE, pd.concat([rest, drop_empty_rows(edited_av)], ignore_index=True))
-                st.success(f"Availability saved for {sel}."); dfs["caregiver_avail"]=load_ui_csvs()["caregiver_avail"]
+                st.success(f"Availability saved for {sel}."); dfs = load_ui_csvs()
 
 # CLIENTS
 with tabs[1]:
@@ -933,7 +926,9 @@ with tabs[1]:
 
     with cl_sub[0]:
         st.subheader("Client List (core profile)")
-        cl_df = dfs["clients"].sort_values("Name", kind="stable").copy()
+        cl_df = dfs["clients"].copy()
+        cl_df["__sort"] = cl_df["Name"].apply(lambda n: (n.split()[-1].lower(), n.lower()) if isinstance(n,str) and n.strip() else ("", ""))
+        cl_df = cl_df.sort_values(["__sort"], kind="stable").drop(columns=["__sort"])
         try:
             cl_df["Importance"] = pd.to_numeric(cl_df["Importance"].replace("", "0"), errors="coerce").fillna(0).astype(int)
         except: cl_df["Importance"] = 0
@@ -958,11 +953,17 @@ with tabs[1]:
             cleaned = drop_empty_rows(edited)
             cleaned["Importance"] = pd.to_numeric(cleaned["Importance"].replace("", "0"), errors="coerce").fillna(0).astype(int)
             save_csv_safe(CLIENT_FILE, cleaned.astype(str))
-            st.success("Client list saved."); dfs["clients"]=load_ui_csvs()["clients"]
+            # purge orphan shift rows
+            keep = set(cleaned["Name"].tolist())
+            fx = dfs["client_fixed"]; fx = fx[fx["Client Name"].isin(keep)].reset_index(drop=True)
+            fl = dfs["client_flex"]; fl = fl[fl["Client Name"].isin(keep)].reset_index(drop=True)
+            save_csv_safe(CLIENT_FIXED_FILE, fx); save_csv_safe(CLIENT_FLEX_FILE, fl)
+            st.success("Client list saved (and orphan shifts purged).")
+            dfs = load_ui_csvs()
 
     with cl_sub[1]:
         st.subheader("Client Shifts")
-        names = sorted(dfs["clients"]["Name"].tolist()) if not dfs["clients"].empty else []
+        names = sort_by_last_name(dfs["clients"]["Name"].tolist()) if not dfs["clients"].empty else []
         sel = st.selectbox("Select Client", options=[""]+names, index=0, key="shift_select")
         if sel:
             cur_24 = dfs["clients"].loc[dfs["clients"]["Name"]==sel, "24_Hour"]
@@ -972,13 +973,15 @@ with tabs[1]:
             c24 = st.checkbox("24-Hour Client", value=cur_24, key=f"c24_{sel}")
             skip_val = st.checkbox("Skip for the week", value=cur_skip, key=f"skip_client_{sel}")
             if st.button("Save 24-Hour / Skip flags for client"):
-                dfs["clients"].loc[dfs["clients"]["Name"]==sel, "24_Hour"] = "True" if c24 else "False"
-                dfs["clients"].loc[dfs["clients"]["Name"]==sel, "SkipForWeek"] = "True" if skip_val else "False"
-                save_csv_safe(CLIENT_FILE, dfs["clients"]); st.success("Client flags saved."); dfs["clients"]=load_ui_csvs()["clients"]; do_rerun()
+                dfc = dfs["clients"].copy()
+                dfc.loc[dfc["Name"]==sel, "24_Hour"] = "True" if c24 else "False"
+                dfc.loc[dfc["Name"]==sel, "SkipForWeek"] = "True" if skip_val else "False"
+                save_csv_safe(CLIENT_FILE, dfc); st.success("Client flags saved."); dfs = load_ui_csvs(); do_rerun()
 
             st.markdown("**Fixed Shifts**")
             sub_fx = dfs["client_fixed"][dfs["client_fixed"]["Client Name"]==sel].copy()
-            sub_fx = ensure_min_rows(sub_fx, 2, {"Client Name": sel, "Day":"", "Start":"", "End":"", "SkipForWeek":"", "Notes":""})
+            if sub_fx.empty:
+                sub_fx = pd.DataFrame([{"Client Name": sel, "Day":"", "Start":"", "End":"", "SkipForWeek":"", "Notes":""}])
             edited_fx = st.data_editor(sub_fx, num_rows="dynamic", width="stretch", key=f"fx_{sel}",
                 column_config={
                     "Client Name": st.column_config.TextColumn("Client Name"),
@@ -992,7 +995,8 @@ with tabs[1]:
 
             st.markdown("**Flexible Shifts**")
             sub_fl = dfs["client_flex"][dfs["client_flex"]["Client Name"]==sel].copy()
-            sub_fl = ensure_min_rows(sub_fl, 2, {"Client Name": sel, "Length (hrs)":"", "Number of Shifts":"", "Start Day":"", "End Day":"", "Start Time":"", "End Time":"", "Consecutive Days":"", "SkipForWeek":"", "Notes":""})
+            if sub_fl.empty:
+                sub_fl = pd.DataFrame([{"Client Name": sel, "Length (hrs)":"", "Number of Shifts":"", "Start Day":"", "End Day":"", "Start Time":"", "End Time":"", "Consecutive Days":"", "SkipForWeek":"", "Notes":""}])
             edited_fl = st.data_editor(sub_fl, num_rows="dynamic", width="stretch", key=f"fl_{sel}",
                 column_config={
                     "Client Name": st.column_config.TextColumn("Client Name"),
@@ -1009,10 +1013,11 @@ with tabs[1]:
             )
 
             if st.button("💾 Save Shifts for selected client"):
-                new_fixed = pd.concat([dfs["client_fixed"][dfs["client_fixed"]["Client Name"]!=sel], drop_empty_rows(edited_fx)], ignore_index=True)
-                new_flex = pd.concat([dfs["client_flex"][dfs["client_flex"]["Client Name"]!=sel], drop_empty_rows(edited_fl)], ignore_index=True)
-                save_csv_safe(CLIENT_FIXED_FILE, new_fixed); save_csv_safe(CLIENT_FLEX_FILE, new_flex)
-                st.success(f"Shifts saved for {sel}."); dfs["client_fixed"]=load_ui_csvs()["client_fixed"]; dfs["client_flex"]=load_ui_csvs()["client_flex"]
+                rest_fx = dfs["client_fixed"][dfs["client_fixed"]["Client Name"]!=sel].copy()
+                rest_fl = dfs["client_flex"][dfs["client_flex"]["Client Name"]!=sel].copy()
+                save_csv_safe(CLIENT_FIXED_FILE, pd.concat([rest_fx, drop_empty_rows(edited_fx)], ignore_index=True))
+                save_csv_safe(CLIENT_FLEX_FILE, pd.concat([rest_fl, drop_empty_rows(edited_fl)], ignore_index=True))
+                st.success(f"Shifts saved for {sel}."); dfs = load_ui_csvs()
 
 # SCHEDULES
 with tabs[2]:
@@ -1035,7 +1040,7 @@ with tabs[2]:
             "iteration": st.session_state["solver_iters"],
             "score": result.diagnostics.get("score",0.0),
             "timestamp": datetime.now().isoformat(),
-            "notes": "day-by-day RR"
+            "notes": "day-by-day RR + night-pair"
         }])], ignore_index=True)
         save_csv_safe(ITER_LOG_FILE, it_df)
         dfs = load_ui_csvs()
@@ -1045,14 +1050,14 @@ with tabs[2]:
 
     with sch_sub[0]:
         st.subheader("Caregiver Schedule Viewer")
-        cg_names = sorted(dfs["caregivers"]["Name"].tolist())
+        cg_names = sort_by_last_name(dfs["caregivers"]["Name"].tolist())
         sel_cg = st.selectbox("Select Caregiver", options=[""]+cg_names, key="sched_cg_select")
         mat = render_schedule_matrix(dfs["best"], mode="caregiver", person=sel_cg)
         st.dataframe(mat, use_container_width=True, height=2000)
 
     with sch_sub[1]:
         st.subheader("Client Schedule Viewer")
-        cl_names = sorted(dfs["clients"]["Name"].tolist())
+        cl_names = sort_by_last_name(dfs["clients"]["Name"].tolist())
         sel_cl = st.selectbox("Select Client", options=[""]+cl_names, key="sched_client_select")
         base = render_schedule_matrix(dfs["best"], mode="client", person=sel_cl)
         all_uncovered, per_client_unfilled = compute_uncovered(dfs)
@@ -1079,7 +1084,7 @@ with tabs[2]:
 
     with sch_sub[2]:
         st.subheader("Manual Shift Assignment")
-        cl_names = sorted(dfs["clients"]["Name"].tolist())
+        cl_names = sort_by_last_name(dfs["clients"]["Name"].tolist())
         sel_client = st.selectbox("Select Client", options=[""]+cl_names, key="manual_select_client")
         if sel_client:
             mat = manual_matrix_from_csv(dfs, sel_client)
@@ -1095,8 +1100,7 @@ with tabs[2]:
                 rest = dfs["manual"][dfs["manual"]["Client Name"]!=sel_client].copy()
                 new = pd.DataFrame(blocks, columns=["Client Name","Caregiver Name","Day","Start","End"])
                 save_csv_safe(MANUAL_SHIFTS_FILE, pd.concat([rest, new], ignore_index=True))
-                st.success("Manual shifts saved.")
-                dfs = load_ui_csvs()
+                st.success("Manual shifts saved."); dfs = load_ui_csvs()
 
 # EXCEPTIONS
 with tabs[3]:
@@ -1139,7 +1143,9 @@ with tabs[3]:
                 mins = parse_minutes(r)
                 if mins is not None and start_min <= mins < end_min:
                     snap.at[r, first["day"]] = f"⚠ {first['client_name']} (exception)"
-            snap_styled = stripe_rows(snap).applymap(lambda v: "color:red; font-weight:600;" if v else "")
+            def stripes2(_):
+                styles = pd.DataFrame('', index=snap.index, columns=snap.columns); styles.iloc[::2,:]='background-color:#f5fbff'; return styles
+            snap_styled = snap.style.apply(stripes2, axis=None).applymap(lambda v: "color:red; font-weight:600;" if v else "")
             st.dataframe(snap_styled, use_container_width=True, height=420)
         else:
             st.warning("Invalid time — cannot render snapshot.")
