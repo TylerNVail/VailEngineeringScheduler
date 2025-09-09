@@ -1,8 +1,12 @@
-# FirstApp.py — ClearConnect (Daytime-only 24h v1)
-# Updates:
-# - 24h clients produce only daytime blocks (07:00–22:00). Nights ignored for now.
-# - Blank availability type => treat as Available (hard).
-# - All prior UI/solver features preserved.
+# FirstApp.py — ClearConnect (Daytime-only 24h + Adaptive Splitting ≥5h)
+# Updates in this version:
+# - 24h clients: daytime-only (07:00–22:00). Nights ignored for now.
+# - Removed duplicate 24h checkbox from Shifts tab (only in Client List).
+# - Availability rows with blank "Availability Type" => treat as Available (hard).
+# - NEW: Adaptive splitting at availability edges when a block can’t be placed:
+#     * Sub-blocks >= 5h: auto-attempt placement.
+#     * Sub-blocks < 5h: require approval before attempting; shows a clear exception row.
+# - All prior rules preserved (travel, city preferences/penalties, day off, daily >9h -> approval, weekly prefs, etc.)
 
 import streamlit as st
 import pandas as pd
@@ -170,7 +174,7 @@ class ScheduleEntry:
 class ExceptionOption:
     exception_id: str
     client_id: str
-    caregiver_id: str
+    caregiver_id: str  # "*" for policy exceptions (like split<5h)
     day: str
     start_time: str
     end_time: str
@@ -201,6 +205,7 @@ def travel_exception_type(city_a:str, city_b:str, pc_crossings_today:int)->Optio
 
 DAILY_AUTO_LIMIT_MIN = 9*60
 AS_MANY_WEEK_CAP_MIN = 50*60
+MIN_AUTO_SUBBLOCK_SLOTS = 5*4  # 5 hours (in 15-min slots)
 
 def is_available(cg:Caregiver, day_full:str, start:str, end:str)->Tuple[bool,bool]:
     """
@@ -212,7 +217,7 @@ def is_available(cg:Caregiver, day_full:str, start:str, end:str)->Tuple[bool,boo
     s = time_to_slot(start); e = time_to_slot(end)
     if e<=s: return (False, False)
     if not segs:
-        # No rows at all -> Not available
+        # No rows at all -> Not available for that day
         return (False, False)
     span = range(s,e)
     covered = [False]*(e-s); prefer=[False]*(e-s)
@@ -315,13 +320,12 @@ def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
     Deterministic, long-chunk splitting with 15-min precision.
     For daytime 07:00–22:00 windows, produce:
       07:00–13:00 (6h), 13:00–19:00 (6h), 19:00–22:00 (3h)
-    For arbitrary windows, cut into ~6–8h pieces (clamped to the window).
+    For arbitrary windows, cut into ~7h pieces (clamped to the window).
     """
     s = time_to_slot(start); e = time_to_slot(end)
     if e <= s:
         return []
     chunks=[]
-    # If fully inside daytime, use anchors for readability/consistency
     DAY_S = time_to_slot("07:00"); DAY_E = time_to_slot("22:00")
     if s >= DAY_S and e <= DAY_E:
         anchors = [s, max(s, time_to_slot("13:00")), max(s, time_to_slot("19:00")), e]
@@ -334,7 +338,6 @@ def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
             if seq[i] < seq[i+1]:
                 chunks.append((seq[i], seq[i+1]))
     else:
-        # Generic: 6–8h slices, deterministic by stepping 24..32 slots
         step = 28  # 7 hours
         cur = s
         while cur < e:
@@ -353,19 +356,17 @@ def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
 # ---------------- Build client blocks ----------------
 def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
     """
-    Key change: if client 24_Hour=True, we only generate daytime blocks 07:00–22:00 per day.
-    Nights (00:00–07:00 and 22:00–24:00) are ignored for now.
+    If client 24_Hour=True, we only generate daytime blocks 07:00–22:00 per day.
+    Nights ignored for now.
     """
     blocks = []; flex_specs = []
     DAY_S = "07:00"; DAY_E = "22:00"
     for c in clients:
-        is_24 = any(r.get("type")=="24flag" for r in c.requests)  # we’ll add this marker below
+        is_24 = any(r.get("type")=="24flag" for r in c.requests)
         for req in c.requests:
             if req.get("type") == "fixed":
-                # If 24h client, ignore parts outside daytime
                 st = max(req["start"], DAY_S) if is_24 else req["start"]
                 en = min(req["end"], DAY_E)   if is_24 else req["end"]
-                # Skip if outside daytime entirely
                 if is_24 and (en <= DAY_S or st >= DAY_E):
                     continue
                 parts = split_fixed_block(req["day"], st, en)
@@ -376,11 +377,10 @@ def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
                         "day": req["day"],
                         "start": stt,
                         "end": enn,
-                        "allow_split": False,
+                        "allow_split": False,   # base fixed piece
                         "flex": False
                     })
             elif req.get("type") == "flexible":
-                # For 24h clients, flex must still land in daytime; enforce via spec (window already constrains it)
                 flex_specs.append({
                     "client_id": c.client_id,
                     "blocks": int(req["blocks"]),
@@ -391,7 +391,6 @@ def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
                     "consecutive": str(req.get("consecutive","")).strip().lower() in ("true","1","t","yes","y")
                 })
             elif req.get("type") == "24flag":
-                # marker only, nothing to append here
                 pass
     return blocks, flex_specs
 
@@ -415,7 +414,6 @@ def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random)->List[D
             valids=[]
             for s in range(ws, max(ws, we - dur_slots) + 1):
                 e = s + dur_slots
-                # Ensure daytime-only placement
                 if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
                 if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
                 valids.append(s)
@@ -486,17 +484,20 @@ def append_pending_exceptions_to_csv(pending:List[ExceptionOption]):
         "Unavailable": "caregiver not available for the entire block",
         "Daily hours >9": "would push daily total above 9 hours",
         "Weekly hours >50 (as-many)": "would push weekly total above 50 hours (as-many-hours cap)",
+        "Split <5h requires approval": "auto-splitting produced a sub-block shorter than 5 hours",
     }
     new_rows=[]
     for ex in pending:
         key = (ex.client_id, ex.caregiver_id, ex.day, ex.start_time, ex.end_time, ex.exception_type)
         if key in keys_existing: continue
         extra = friendly.get(ex.exception_type, "constraint would be violated")
-        summary = f"{ex.caregiver_id} could cover {ex.client_id} on {ex.day} {ex.start_time}-{ex.end_time}, but this would break: {ex.exception_type} ({extra})."
+        # caregiver_id may be "*" for split-policy approvals
+        cg_name = ex.caregiver_id if ex.caregiver_id else "*"
+        summary = f"{cg_name} could cover {ex.client_id} on {ex.day} {ex.start_time}-{ex.end_time}, but this would break: {ex.exception_type} ({extra})."
         new_rows.append({
             "approval_id": f"A_{uuid.uuid4().hex[:8]}",
             "client_name": ex.client_id,
-            "caregiver_name": ex.caregiver_id,
+            "caregiver_name": cg_name,
             "day": ex.day,
             "start": ex.start_time,
             "end": ex.end_time,
@@ -519,10 +520,8 @@ def build_client_objects_from_dfs(dfs):
         if str(r.get("SkipForWeek","")).strip().lower() in ("true","1","t","yes","y"): continue
         reqs=[]
         if str(r.get("24_Hour","")).strip().lower() in ("true","1","t","yes","y"):
-            # Daytime-only 24h: add 07:00–22:00 fixed for each day
             for d in DAYS_FULL:
                 reqs.append({"type":"fixed","day": d, "start":"07:00", "end":"22:00"})
-            # Add a marker so expand function knows to clamp other requests to daytime
             reqs.append({"type":"24flag"})
         fixed_rows = dfs["client_fixed"][dfs["client_fixed"]["Client Name"]==r["Name"]]
         for _, fr in fixed_rows.iterrows():
@@ -597,7 +596,6 @@ def representative_slot_for_flex(spec)->Optional[Tuple[str,str,str]]:
     for d in spec["days"]:
         for s in range(ws, max(ws, we - dur_slots) + 1):
             e = s + dur_slots
-            # Daytime only
             if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
             if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
             return d, slot_to_time(s), slot_to_time(e)
@@ -638,7 +636,7 @@ def compute_uncovered(dfs)->Tuple[pd.DataFrame, Dict[str, List[Dict]]]:
         per_client_unfilled[f["client_id"]].append({"day": f["day"], "start": f["start"], "end": f["end"], "label": "Not covered (F)"})
     return mat, per_client_unfilled
 
-# ---------------- Solver (no night pairing needed) ----------------
+# ---------------- Solver (with Adaptive Splitting ≥5h) ----------------
 def solve_week(
     caregivers:List[Caregiver],
     clients:List[Client],
@@ -662,13 +660,19 @@ def solve_week(
         for _, r in manual_locks.iterrows():
             locks.append((r["Client Name"], r["Day"], r["Start"], r["End"], r["Caregiver Name"], "Assigned (Manual)"))
 
-    approved_overrides=[]; declined_blacklist=set()
+    approved_overrides=[]; declined_blacklist=set(); approved_small_splits=set()
     if approvals_df is not None and not approvals_df.empty:
         for _, r in approvals_df.iterrows():
             key = (r["client_name"], r["day"], r["start"], r["end"], r["caregiver_name"])
             dec = str(r.get("decision","")).lower()
-            if dec == "approved": approved_overrides.append(key)
-            elif dec == "declined": declined_blacklist.add(key)
+            ct = str(r.get("constraint_type",""))
+            if dec == "approved":
+                if r["caregiver_name"] == "*" and "Split <5h" in ct:
+                    approved_small_splits.add((r["client_name"], r["day"], r["start"], r["end"]))
+                else:
+                    approved_overrides.append(key)
+            elif dec == "declined":
+                declined_blacklist.add(key)
 
     rng = random.Random(random_seed)
     fixed_blocks, flex_specs = expand_client_requests(clients)
@@ -708,6 +712,104 @@ def solve_week(
                         order.append(bucket[cid].pop(0))
         return order
 
+    def candidate_caregivers(cl, cl_city):
+        cand = [c for c in caregivers if c.caregiver_id not in cl.banned_caregivers]
+        cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
+        cand.sort(key=lambda cg: 0 if cg.base_location==cl_city else 1)
+        return cand
+
+    def can_place_single(cg:Caregiver, cl_city:str, day:str, s:int, e:int)->Tuple[bool, Optional[str], bool]:
+        hard_ok, soft_prefer = is_available(cg, day, slot_to_time(s), slot_to_time(e))
+        if not hard_ok: return (False, "Unavailable", soft_prefer)
+        if would_break_day_off(cg, day, s, e): return (False, "Day off", soft_prefer)
+        if has_overlap(cg, day, s, e): return (False, "Overlap", soft_prefer)
+        if current_daily_minutes(cg, day) + (e-s)*15 > DAILY_AUTO_LIMIT_MIN: return (False, "Daily hours >9", soft_prefer)
+        if cg.as_many_hours and (current_week_minutes(cg) + (e-s)*15 > AS_MANY_WEEK_CAP_MIN): return (False, "Weekly hours >50 (as-many)", soft_prefer)
+        violates, ex_type = will_violate_travel(cg, day, s, e, cl_city)
+        if violates: return (False, ex_type or "Travel", soft_prefer)
+        return (True, None, soft_prefer)
+
+    def force_place(clid, day, st, en, caregiver_id, status="Assigned (Approved/Locked)"):
+        cg = cg_map.get(caregiver_id); 
+        if not cg: return False
+        s=time_to_slot(st); e=time_to_slot(en); cl_city = cl_city_for(clid)
+        ok, err, _ = can_place_single(cg, cl_city, day, s, e)
+        if not ok:
+            exceptions.append(ExceptionOption(f"E_{uuid.uuid4().hex[:8]}", clid, caregiver_id, day, st, en, err or "Constraint", {})); 
+            return False
+        assignments.append(ScheduleEntry(f"B_{uuid.uuid4().hex[:8]}", clid, caregiver_id, day, st, en, status))
+        add_assignment(cg, day, s, e, clid)
+        return True
+
+    def availability_edges_for_window(day:str, s:int, e:int)->List[int]:
+        """Collect cut-points from all caregiver availability segment boundaries that fall within [s,e]."""
+        pts = {s, e}
+        for cg in caregivers:
+            segs = cg.availability.get(UI_TO_SHORT.get(day, day), [])
+            for seg in segs:
+                st = time_to_slot(seg.get("start","00:00")); en = time_to_slot(seg.get("end","00:00"))
+                # consider only segments that overlap window
+                if st < e and en > s:
+                    pts.add(max(s, st)); pts.add(min(e, en))
+        pts = [p for p in pts if s <= p <= e]
+        pts.sort()
+        return pts
+
+    def try_assign_segment(cl, cl_city, day, s, e):
+        placed = False; local_excs=[]
+        for cg in candidate_caregivers(cl, cl_city):
+            if (cl.client_id, day, slot_to_time(s), slot_to_time(e), cg.caregiver_id) in declined_blacklist:
+                local_excs.append((cg.caregiver_id, "Declined earlier")); continue
+            ok, err, soft = can_place_single(cg, cl_city, day, s, e)
+            if not ok:
+                local_excs.append((cg.caregiver_id, err or "Constraint")); continue
+            status = "Assigned" if not soft else "Suggested (Soft)"
+            assignments.append(ScheduleEntry(f"B_{uuid.uuid4().hex[:8]}", cl.client_id, cg.caregiver_id, day, slot_to_time(s), slot_to_time(e), status))
+            add_assignment(cg, day, s, e, cl.client_id)
+            placed=True; break
+        if not placed:
+            used=set()
+            for cg_id, ex_type in local_excs:
+                if cg_id in used: continue
+                used.add(cg_id)
+                exceptions.append(ExceptionOption(
+                    exception_id=f"E_{uuid.uuid4().hex[:8]}",
+                    client_id=cl.client_id, caregiver_id=cg_id, day=day,
+                    start_time=slot_to_time(s), end_time=slot_to_time(e), exception_type=ex_type or "Constraint", details={}
+                ))
+                if len(used)>=5: break
+        return placed
+
+    def adaptive_split_and_place(cl, day, s, e):
+        """Auto-split at availability edges. >=5h segments are attempted; <5h require prior approval."""
+        cl_city = cl.base_location
+        pts = availability_edges_for_window(day, s, e)
+        if len(pts) <= 2:
+            return False  # nothing to split with
+        any_placed = False
+        for i in range(len(pts)-1):
+            a, b = pts[i], pts[i+1]
+            if a >= b: continue
+            seg_len = b - a
+            if seg_len >= MIN_AUTO_SUBBLOCK_SLOTS:
+                # try place this segment normally
+                placed = try_assign_segment(cl, cl_city, day, a, b)
+                any_placed = any_placed or placed
+            else:
+                # sub-5h: require approval before attempting
+                key = (cl.client_id, day, slot_to_time(a), slot_to_time(b))
+                if key in approved_small_splits:
+                    placed = try_assign_segment(cl, cl_city, day, a, b)
+                    any_placed = any_placed or placed
+                else:
+                    exceptions.append(ExceptionOption(
+                        exception_id=f"E_{uuid.uuid4().hex[:8]}",
+                        client_id=cl.client_id, caregiver_id="*",
+                        day=day, start_time=slot_to_time(a), end_time=slot_to_time(b),
+                        exception_type="Split <5h requires approval", details={}
+                    ))
+        return any_placed
+
     best_assignments=[]; best_exceptions=[]; best_score=None
 
     for it in range(max(1, int(iterations))):
@@ -716,29 +818,6 @@ def solve_week(
             cg.work_log = defaultdict(list); cg.daily_city_trips = defaultdict(int)
 
         assignments=[]; exceptions=[]
-
-        def can_place_single(cg:Caregiver, cl_city:str, day:str, s:int, e:int)->Tuple[bool, Optional[str], bool]:
-            hard_ok, soft_prefer = is_available(cg, day, slot_to_time(s), slot_to_time(e))
-            if not hard_ok: return (False, "Unavailable", soft_prefer)
-            if would_break_day_off(cg, day, s, e): return (False, "Day off", soft_prefer)
-            if has_overlap(cg, day, s, e): return (False, "Overlap", soft_prefer)
-            if current_daily_minutes(cg, day) + (e-s)*15 > DAILY_AUTO_LIMIT_MIN: return (False, "Daily hours >9", soft_prefer)
-            if cg.as_many_hours and (current_week_minutes(cg) + (e-s)*15 > AS_MANY_WEEK_CAP_MIN): return (False, "Weekly hours >50 (as-many)", soft_prefer)
-            violates, ex_type = will_violate_travel(cg, day, s, e, cl_city)
-            if violates: return (False, ex_type or "Travel", soft_prefer)
-            return (True, None, soft_prefer)
-
-        def force_place(clid, day, st, en, caregiver_id, status="Assigned (Approved/Locked)"):
-            cg = cg_map.get(caregiver_id); 
-            if not cg: return False
-            s=time_to_slot(st); e=time_to_slot(en); cl_city = cl_city_for(clid)
-            ok, err, _ = can_place_single(cg, cl_city, day, s, e)
-            if not ok:
-                exceptions.append(ExceptionOption(f"E_{uuid.uuid4().hex[:8]}", clid, caregiver_id, day, st, en, err or "Constraint", {})); 
-                return False
-            assignments.append(ScheduleEntry(f"B_{uuid.uuid4().hex[:8]}", clid, caregiver_id, day, st, en, status))
-            add_assignment(cg, day, s, e, clid)
-            return True
 
         # apply locks and approvals first
         for clid, day, stt, enn, cg_id, label in locks:
@@ -757,38 +836,22 @@ def solve_week(
                 cl = client_map[b["client_id"]]; cl_city = cl.base_location
                 s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
 
-                # candidates: prefer preferred caregivers & same-city first
-                cand = [c for c in caregivers if c.caregiver_id not in cl.banned_caregivers]
-                # client preference first
-                cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
-                # then same base location
-                cand.sort(key=lambda cg: 0 if cg.base_location==cl_city else 1)
+                # First, try whole segment
+                if try_assign_segment(cl, cl_city, day, s, e):
+                    continue
 
-                placed=False; local_excs=[]
-
-                for cg in cand:
-                    if (cl.client_id, day, b["start"], b["end"], cg.caregiver_id) in declined_blacklist:
-                        local_excs.append((cg.caregiver_id, "Declined earlier")); continue
-
-                    ok, err, soft = can_place_single(cg, cl_city, day, s, e)
-                    if not ok:
-                        local_excs.append((cg.caregiver_id, err or "Constraint")); continue
-                    status = "Assigned" if not soft else "Suggested (Soft)"
-                    assignments.append(ScheduleEntry(b["block_id"], cl.client_id, cg.caregiver_id, day, b["start"], b["end"], status))
-                    add_assignment(cg, day, s, e, cl.client_id)
-                    placed=True; break
-
-                if not placed:
-                    used=set()
-                    for cg_id, ex_type in local_excs:
-                        if cg_id in used: continue
-                        used.add(cg_id)
-                        exceptions.append(ExceptionOption(
-                            exception_id=f"E_{uuid.uuid4().hex[:8]}",
-                            client_id=cl.client_id, caregiver_id=cg_id, day=day,
-                            start_time=b["start"], end_time=b["end"], exception_type=ex_type or "Constraint", details={}
-                        ))
-                        if len(used)>=5: break
+                # If whole failed, and window is big (or flex), try adaptive split
+                duration_slots = e - s
+                if duration_slots >= MIN_AUTO_SUBBLOCK_SLOTS or b.get("flex", False):
+                    adaptive_split_and_place(cl, day, s, e)
+                else:
+                    # Too small to place and not eligible for adaptive split auto-attempt
+                    exceptions.append(ExceptionOption(
+                        exception_id=f"E_{uuid.uuid4().hex[:8]}",
+                        client_id=cl.client_id, caregiver_id="*",
+                        day=day, start_time=b["start"], end_time=b["end"],
+                        exception_type="Split <5h requires approval", details={}
+                    ))
 
         sc = score_solution(assignments, pr_map, {c.caregiver_id:c for c in caregivers})
         if best_score is None or sc>best_score:
@@ -975,18 +1038,7 @@ with tabs[1]:
         names = sort_by_last_name(dfs["clients"]["Name"].tolist()) if not dfs["clients"].empty else []
         sel = st.selectbox("Select Client", options=[""]+names, index=0, key="shift_select")
         if sel:
-            cur_24 = dfs["clients"].loc[dfs["clients"]["Name"]==sel, "24_Hour"]
-            cur_24 = (str(cur_24.iloc[0]).strip().lower() in ("true","1","t","yes","y")) if len(cur_24)>0 else False
-            cur_skip = dfs["clients"].loc[dfs["clients"]["Name"]==sel, "SkipForWeek"]
-            cur_skip = (str(cur_skip.iloc[0]).strip().lower() in ("true","1","t","yes","y")) if len(cur_skip)>0 else False
-            c24 = st.checkbox("24-Hour Client (daytime only for now: 07:00–22:00)", value=cur_24, key=f"c24_{sel}")
-            skip_val = st.checkbox("Skip for the week", value=cur_skip, key=f"skip_client_{sel}")
-            if st.button("Save 24-Hour / Skip flags for client"):
-                dfc = dfs["clients"].copy()
-                dfc.loc[dfc["Name"]==sel, "24_Hour"] = "True" if c24 else "False"
-                dfc.loc[dfc["Name"]==sel, "SkipForWeek"] = "True" if skip_val else "False"
-                save_csv_safe(CLIENT_FILE, dfc); st.success("Client flags saved."); dfs = load_ui_csvs(); do_rerun()
-
+            # Removed 24h toggle here per your request; it now lives only on Client List.
             st.markdown("**Fixed Shifts**")
             sub_fx = dfs["client_fixed"][dfs["client_fixed"]["Client Name"]==sel].copy()
             if sub_fx.empty:
@@ -1049,7 +1101,7 @@ with tabs[2]:
             "iteration": st.session_state["solver_iters"],
             "score": result.diagnostics.get("score",0.0),
             "timestamp": datetime.now().isoformat(),
-            "notes": "daytime-only 24h"
+            "notes": "daytime-only 24h + adaptive split ≥5h"
         }])], ignore_index=True)
         save_csv_safe(ITER_LOG_FILE, it_df)
         dfs = load_ui_csvs()
