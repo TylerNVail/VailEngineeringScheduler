@@ -301,28 +301,64 @@ def score_solution(assignments:List[ScheduleEntry], client_priority:Dict[str,int
 
 # ---------------- Split fixed into chunks (keeps 00–07 and 22–24) ----------------
 def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
+    """
+    Deterministic split for reliability:
+      - Always create [00:00–07:00]
+      - Split daytime 07:00–22:00 into 6–8h chunks but with a deterministic pattern:
+          07:00–13:00 (6h), 13:00–19:00 (6h), 19:00–22:00 (3h)  [the last can be 3–5h]
+      - Always create [22:00–24:00]
+    For non-24h windows, we still respect 00–07 and 22–24 edges explicitly and split the middle.
+    """
     s = time_to_slot(start); e = time_to_slot(end)
-    if e<=s: return []
-    chunks=[]
-    if s < NIGHT_END:  # 00:00–07:00
-        ns = s; ne = min(e, NIGHT_END)
-        if ns < ne: chunks.append((ns, ne))
+    if e <= s:
+        return []
+
+    chunks = []
+    # 1) 00–07 edge if overlaps
+    if s < NIGHT_END:
+        ns = s
+        ne = min(e, NIGHT_END)
+        if ns < ne:
+            chunks.append((ns, ne))
         s = max(s, NIGHT_END)
-    while s < min(e, NIGHT_START):  # 07:00–22:00
-        cut = min(NIGHT_START, s + random.randint(24, 32))  # 6–8h
-        cut = min(cut, e)
-        chunks.append((s, cut))
-        s = cut
-    if e > NIGHT_START:  # 22:00–24:00
-        ns = max(s, NIGHT_START); ne = e
-        if ns < ne: chunks.append((ns, ne))
-    # merge touching
-    merged=[]
+
+    # 2) Daytime 07–22
+    day_start = max(s, NIGHT_END)
+    day_end   = min(e, NIGHT_START)
+    if day_start < day_end:
+        # If the whole day range is inside 07–22, split deterministically:
+        # 07–13, 13–19, 19–22 (some may clamp depending on bounds)
+        anchors = [day_start, time_to_slot("13:00"), time_to_slot("19:00"), day_end]
+        # Clamp anchors to [day_start, day_end]
+        anchors = [max(day_start, min(a, day_end)) for a in anchors]
+        # Build monotone unique sequence
+        seq = [anchors[0]]
+        for a in anchors[1:]:
+            if a > seq[-1]:
+                seq.append(a)
+        # Emit consecutive segments
+        for i in range(len(seq)-1):
+            if seq[i] < seq[i+1]:
+                chunks.append((seq[i], seq[i+1]))
+
+    # 3) 22–24 edge if overlaps
+    if e > NIGHT_START:
+        ns = max(s, NIGHT_START)
+        ne = e
+        if ns < ne:
+            chunks.append((ns, ne))
+
+    # Merge any touching segments
+    merged = []
     for seg in chunks:
-        if not merged: merged=[seg]
-        elif merged[-1][1]==seg[0]: merged[-1]=(merged[-1][0], seg[1])
-        else: merged.append(seg)
-    return [(slot_to_time(x[0]), slot_to_time(x[1])) for x in merged]
+        if not merged:
+            merged = [seg]
+        elif merged[-1][1] == seg[0]:
+            merged[-1] = (merged[-1][0], seg[1])
+        else:
+            merged.append(seg)
+
+    return [(slot_to_time(a), slot_to_time(b)) for (a,b) in merged]
 
 # ---------------- Build client blocks ----------------
 def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
