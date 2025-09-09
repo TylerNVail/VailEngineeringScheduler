@@ -315,43 +315,60 @@ def score_solution(assignments:List[ScheduleEntry], client_priority:Dict[str,int
     return score
 
 # ---------------- Split fixed into chunks ----------------
-def split_fixed_block(day:str, start:str, end:str)->List[Tuple[str,str]]:
+def split_fixed_block(day: str, start: str, end: str) -> List[Tuple[str, str]]:
     """
-    Deterministic, long-chunk splitting with 15-min precision.
-    For daytime 07:00–22:00 windows, produce:
-      07:00–13:00 (6h), 13:00–19:00 (6h), 19:00–22:00 (3h)
-    For arbitrary windows, cut into ~7h pieces (clamped to the window).
+    Splits a fixed request window using simple duration rules (15-minute precision):
+      - duration <= 9h: keep whole
+      - 9h < duration < 12h: split into 2 equal parts
+      - 12h <= duration <= 15h: split into 3 equal parts
+    Returns list of (start_time_str, end_time_str) segments that fully cover [start, end].
     """
-    s = time_to_slot(start); e = time_to_slot(end)
+    s = time_to_slot(start)
+    e = time_to_slot(end)
     if e <= s:
         return []
-    chunks=[]
-    DAY_S = time_to_slot("07:00"); DAY_E = time_to_slot("22:00")
-    if s >= DAY_S and e <= DAY_E:
-        anchors = [s, max(s, time_to_slot("13:00")), max(s, time_to_slot("19:00")), e]
-        anchors = [max(s, min(a, e)) for a in anchors]
-        seq = [anchors[0]]
-        for a in anchors[1:]:
-            if a > seq[-1]:
-                seq.append(a)
-        for i in range(len(seq)-1):
-            if seq[i] < seq[i+1]:
-                chunks.append((seq[i], seq[i+1]))
-    else:
-        step = 28  # 7 hours
-        cur = s
-        while cur < e:
-            cut = min(e, cur + step)
-            chunks.append((cur, cut))
-            cur = cut
 
-    # merge touching
-    merged=[]
-    for seg in chunks:
-        if not merged: merged=[seg]
-        elif merged[-1][1]==seg[0]: merged[-1]=(merged[-1][0], seg[1])
-        else: merged.append(seg)
-    return [(slot_to_time(x[0]), slot_to_time(x[1])) for x in merged]
+    duration_slots = e - s  # 15-minute slots
+    # thresholds in slots
+    H9 = 9 * 4
+    H12 = 12 * 4
+    H15 = 15 * 4  # our daytime cap (07:00–22:00) is 15h
+
+    # Case 1: keep whole (<= 9h)
+    if duration_slots <= H9:
+        return [(slot_to_time(s), slot_to_time(e))]
+
+    # Helper: split into N nearly equal parts
+    def split_into_n(start_slot: int, end_slot: int, n: int) -> List[Tuple[str, str]]:
+        total = end_slot - start_slot
+        base = total // n
+        rem = total % n
+        parts = []
+        cur = start_slot
+        for i in range(n):
+            span = base + (1 if i < rem else 0)
+            parts.append((slot_to_time(cur), slot_to_time(cur + span)))
+            cur += span
+        return parts
+
+    # Case 2: 9h < duration < 12h -> 2 parts
+    if duration_slots < H12:
+        return split_into_n(s, e, 2)
+
+    # Case 3: 12h <= duration <= 15h -> 3 parts
+    if duration_slots <= H15:
+        return split_into_n(s, e, 3)
+
+    # Fallback (shouldn't happen with daytime-only, but safe anyway):
+    # Split into ~7h chunks to keep segments manageable.
+    chunks = []
+    step = 28  # 7 hours in slots
+    cur = s
+    while cur < e:
+        cut = min(e, cur + step)
+        chunks.append((slot_to_time(cur), slot_to_time(cut)))
+        cur = cut
+    return chunks
 
 # ---------------- Build client blocks ----------------
 def expand_client_requests(clients:List[Client])->Tuple[List[Dict], List[Dict]]:
