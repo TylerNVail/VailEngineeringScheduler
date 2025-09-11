@@ -1152,12 +1152,7 @@ with tabs[2]:
         cg_names = sort_by_last_name(dfs["caregivers"]["Name"].tolist())
         sel_cg = st.selectbox("Select Caregiver", options=[""]+cg_names, key="sched_cg_select")
         mat = render_schedule_matrix(dfs["best"], mode="caregiver", person=sel_cg)
-        def stripes(_):
-            styles = pd.DataFrame('', index=mat.index, columns=mat.columns)
-            styles.iloc[::2, :] = 'background-color:#f5fbff'
-            return styles
-        styled_cg = mat.style.apply(stripes, axis=None)
-        st.dataframe(styled_cg, use_container_width=True, height=2000)
+        st.dataframe(mat, use_container_width=True, height=2000)
 
     with sch_sub[1]:
         st.subheader("Client Schedule Viewer")
