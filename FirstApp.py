@@ -90,6 +90,9 @@ if "solver_iters" not in st.session_state:
     st.session_state["solver_iters"] = 500
 if "solver_time" not in st.session_state:
     st.session_state["solver_time"] = 10
+if "max_dynamic_split_passes" not in st.session_state:
+    # Recommended default for dynamic multi-pass splitting orchestration
+    st.session_state["max_dynamic_split_passes"] = 6
 
 # ============ Time / helpers ============
 DAYS_FULL = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
@@ -467,7 +470,7 @@ def build_caregiver_objects_from_dfs(dfs):
     return caregivers
 
 # ============ Uncovered overlays ============
-def compute_all_requested_blocks(clients:List[Client]):
+def compute_all_requested_blocks(clients:List[Client], fixed_split_mode:str="91215"):
     fixed_blocks, flex_specs = [], []
     DAY_S, DAY_E = "07:00", "22:00"
     for c in clients:
@@ -477,7 +480,10 @@ def compute_all_requested_blocks(clients:List[Client]):
                 st = max(req["start"], DAY_S) if is_24 else req["start"]
                 en = min(req["end"], DAY_E)   if is_24 else req["end"]
                 if is_24 and (en <= DAY_S or st >= DAY_E): continue
-                parts = split_fixed_block(req["day"], st, en)
+                if fixed_split_mode == "none":
+                    parts = [(st, en)]
+                else:
+                    parts = split_fixed_block(req["day"], st, en)
                 for stt,enn in parts:
                     fixed_blocks.append({"block_id": f"B_{uuid.uuid4().hex[:8]}","client_id": c.client_id,"day": req["day"],"start": stt,"end": enn,"allow_split": False,"flex": False})
             elif req.get("type")=="flexible":
@@ -642,7 +648,7 @@ def solve_week(
                 declined_blacklist.add(key)
 
     rng = random.Random(random_seed)
-    fixed_blocks, flex_specs = compute_all_requested_blocks(clients)
+    fixed_blocks, flex_specs = compute_all_requested_blocks(clients, fixed_split_mode="none")
     pr_map = {c.client_id: c.priority for c in clients}
     client_map = {c.client_id: c for c in clients}
     cg_map = {c.caregiver_id: c for c in caregivers}
@@ -678,6 +684,7 @@ def solve_week(
                 used_days.append(d); want -= 1
         return placed
 
+    # Build using dynamic strategy: do not pre-split fixed blocks; allow adaptive splitting in later passes
     flex_blocks = place_flex_blocks_one_plan(flex_specs, rng)
     all_blocks = fixed_blocks + flex_blocks
 
@@ -819,7 +826,9 @@ def solve_week(
         pts.sort()
         return pts
 
-    def adaptive_split_and_place(cl, day, s, e):
+    def adaptive_split_and_place(cl, day, s, e, min_subblock_slots:int, allow_split:bool):
+        if not allow_split:
+            return False
         cl_city = cl.base_location
         pts = availability_edges_for_window(day, s, e)
         if len(pts) <= 2: return False
@@ -828,21 +837,21 @@ def solve_week(
             a, b = pts[i], pts[i+1]
             if a >= b: continue
             seg_len = b - a
-            if seg_len >= MIN_AUTO_SUBBLOCK_SLOTS:
+            if seg_len >= min_subblock_slots:
                 placed = try_assign_segment(cl, cl_city, day, a, b)
                 any_placed = any_placed or placed
-            else:
-                key = (cl.client_id, day, slot_to_time(a), slot_to_time(b))
-                if key in approved_small_splits:
-                    placed = try_assign_segment(cl, cl_city, day, a, b)
-                    any_placed = any_placed or placed
-                else:
-                    exceptions.append(ExceptionOption(
-                        exception_id=f"E_{uuid.uuid4().hex[:8]}",
-                        client_id=cl.client_id, caregiver_id="*",
-                        day=day, start_time=slot_to_time(a), end_time=slot_to_time(b),
-                        exception_type="Split <5h requires approval", details={}
-                    ))
+            # below min_subblock_slots: skip (no approval required; we simply don't place sub-2h segments)
+        # If nothing placed using edges, try halving fallback (two chunks)
+        if not any_placed:
+            mid = s + (e - s)//2
+            left_ok = (mid - s) >= min_subblock_slots
+            right_ok = (e - mid) >= min_subblock_slots
+            if left_ok:
+                placed = try_assign_segment(cl, cl_city, day, s, mid)
+                any_placed = any_placed or placed
+            if right_ok:
+                placed = try_assign_segment(cl, cl_city, day, mid, e)
+                any_placed = any_placed or placed
         return any_placed
 
     # Manual overlap behavior: if fully covered by existing (locks incl. manual), skip;
@@ -856,49 +865,70 @@ def solve_week(
                         return True
         return False
 
-    # Iterate per iteration with different day orders
+    # Multi-pass orchestration: start with no-split, then allow adaptive splitting with decreasing min length to 2h
+    max_passes = 6
+    try:
+        max_passes = int(st.session_state.get("max_dynamic_split_passes", 6))
+    except Exception:
+        pass
+    # Threshold schedule in 15-min slots: INF, 6h, 5h, 4h, 3h, 2h
+    base_schedule = [10**9, 6*4, 5*4, 4*4, 3*4, 2*4]
+    schedule = base_schedule[:max_passes] if max_passes <= len(base_schedule) else base_schedule + [2*4]*(max_passes-len(base_schedule))
+
     best_assignments=[]; best_exceptions=[]; best_score=None
-    for it in range(max(1, int(iterations))):
-        # Reset work logs each iteration (locks are already applied to assignments)
-        for cg in caregivers:
-            cg.work_log = defaultdict(list); cg.daily_city_trips = defaultdict(int)
-        # Reapply current assignments (locks/approvals) to logs
-        for a in assignments:
-            cg = next((x for x in caregivers if x.caregiver_id==a.caregiver_id), None)
-            if cg:
-                add_assignment(cg, a.day, time_to_slot(a.start_time), time_to_slot(a.end_time), a.client_id)
+    carried_locks = []
+    for pass_idx, min_subblock_slots in enumerate(schedule):
+        allow_split = (pass_idx > 0)
 
-        rng.seed(random_seed + it*7919)
-        day_order = DAYS_FULL[:]; rng.shuffle(day_order)
+        # reset assignment state for this pass, include base locks and carried from previous passes
+        assignments=[]; exceptions=[]
+        # Rebuild locks: base locks already in `locks`; add carried ones
+        local_locks = locks + carried_locks
+        for clid, day, stt, enn, cg_id, label in local_locks:
+            force_place(clid, day, stt, enn, cg_id, status=label)
+        for (clid, day, stt, enn, cg_id) in approved_overrides:
+            if any(a.client_id==clid and a.day==day and a.start_time==stt and a.end_time==enn for a in assignments): continue
+            force_place(clid, day, stt, enn, cg_id, status="Assigned (Approved)")
 
-        for day in day_order:
-            seq = day_round_order(day)
-            for b in seq:
-                cl = client_map[b["client_id"]]; cl_city = cl.base_location
-                s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
+        # Iterate restarts
+        for it in range(max(1, int(iterations))):
+            # Reset work logs each iteration (locks are already applied to assignments)
+            for cg in caregivers:
+                cg.work_log = defaultdict(list); cg.daily_city_trips = defaultdict(int)
+            # Reapply current assignments (locks/approvals) to logs
+            for a in assignments:
+                cg = next((x for x in caregivers if x.caregiver_id==a.caregiver_id), None)
+                if cg:
+                    add_assignment(cg, a.day, time_to_slot(a.start_time), time_to_slot(a.end_time), a.client_id)
 
-                if is_client_interval_fully_covered_by(assignments, cl.client_id, day, s, e):
-                    continue
-                if has_partial_overlap(cl.client_id, day, s, e):
-                    continue
+            rng.seed(random_seed + pass_idx*1543 + it*7919)
+            day_order = DAYS_FULL[:]; rng.shuffle(day_order)
 
-                if try_assign_segment(cl, cl_city, day, s, e):
-                    continue
+            for day in day_order:
+                seq = day_round_order(day)
+                for b in seq:
+                    cl = client_map[b["client_id"]]; cl_city = cl.base_location
+                    s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
 
-                duration_slots = e - s
-                if duration_slots >= MIN_AUTO_SUBBLOCK_SLOTS or b.get("flex", False):
-                    adaptive_split_and_place(cl, day, s, e)
-                else:
-                    exceptions.append(ExceptionOption(
-                        exception_id=f"E_{uuid.uuid4().hex[:8]}",
-                        client_id=cl.client_id, caregiver_id="*",
-                        day=day, start_time=b["start"], end_time=b["end"],
-                        exception_type="Split <5h requires approval", details={}
-                    ))
+                    if is_client_interval_fully_covered_by(assignments, cl.client_id, day, s, e):
+                        continue
+                    if has_partial_overlap(cl.client_id, day, s, e):
+                        continue
 
-        sc = score_solution(assignments, pr_map, {c.caregiver_id:c for c in caregivers})
-        if best_score is None or sc>best_score:
-            best_score = sc; best_assignments = assignments.copy(); best_exceptions = exceptions.copy()
+                    if try_assign_segment(cl, cl_city, day, s, e):
+                        continue
+
+                    # Adaptive splitting based on current pass threshold and allowance
+                    adaptive_split_and_place(cl, day, s, e, min_subblock_slots=min_subblock_slots, allow_split=allow_split)
+
+            sc = score_solution(assignments, pr_map, {c.caregiver_id:c for c in caregivers})
+            if best_score is None or sc>best_score:
+                best_score = sc; best_assignments = assignments.copy(); best_exceptions = exceptions.copy()
+
+        # Carry forward newly placed assignments as locks for next pass
+        # Build set for quick diff
+        if pass_idx < len(schedule)-1:
+            carried_locks = [(a.client_id, a.day, a.start_time, a.end_time, a.caregiver_id, "Assigned (Locked)") for a in best_assignments]
 
     # write best solution csv
     pd.DataFrame([{
@@ -1297,6 +1327,14 @@ with tabs[4]:
     st.subheader("Solver Settings")
     st.session_state["solver_iters"] = st.number_input("Iterative solving (restarts)", min_value=1, value=st.session_state["solver_iters"], step=1, key="iterative_solving_count_settings")
     st.session_state["solver_time"] = st.number_input("Per-iteration time limit (seconds)", min_value=1, value=st.session_state["solver_time"], step=1, key="per_iter_time_settings")
+    st.session_state["max_dynamic_split_passes"] = st.number_input(
+        "Max dynamic split passes",
+        min_value=1,
+        value=int(st.session_state.get("max_dynamic_split_passes", 6)),
+        step=1,
+        key="max_dynamic_split_passes_settings",
+        help="Upper bound on multi-pass dynamic splitting rounds (recommended: 6)."
+    )
     st.caption("Used when you click 'Solve Schedules' on the Schedules tab.")
 
     st.subheader("Data Export/Import")
