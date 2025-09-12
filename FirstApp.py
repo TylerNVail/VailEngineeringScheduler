@@ -654,37 +654,44 @@ def solve_week(
     cg_map = {c.caregiver_id: c for c in caregivers}
 
     # compose blocks incl. flex placement
-    def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random)->List[Dict]:
+    def place_flex_blocks_one_plan(flex_specs:List[Dict], rng:random.Random, start_index:int=0)->List[Dict]:
+        # Deterministic earliest-first placement candidates for flex (unsplit); solver will handle splitting in later passes
         placed=[]
         d2i = {d:i for i,d in enumerate(DAYS_FULL)}
         for spec in flex_specs:
             dur_slots = int(round(spec["duration"]*4))
             ws = time_to_slot(spec["window_start"]); we = time_to_slot(spec["window_end"])
-            allowed_days = list(spec["days"]); rng.shuffle(allowed_days)
-            want = int(spec["blocks"]); used_days=[]; tries=0
+            allowed_days = [d for d in DAYS_FULL if d in spec["days"]]
+            want = int(spec["blocks"]); used_days=[]
             def ok_gap(newd):
                 if spec["consecutive"]: return True
                 ni = d2i[newd]
                 return all(min((ni - d2i[u]) % 7, (d2i[u] - ni) % 7) >= 2 for u in used_days)
-            while want>0 and tries<600:
-                tries+=1
-                if not allowed_days: break
-                d = allowed_days[tries % len(allowed_days)]
-                if not ok_gap(d): continue
-                valids=[]
+            # build ordered candidate starts for each allowed day
+            per_day_candidates = {}
+            for d in allowed_days:
+                candidates=[]
                 for s in range(ws, max(ws, we - dur_slots) + 1):
                     e = s + dur_slots
                     if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
                     if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
-                    valids.append(s)
-                rng.shuffle(valids)
-                if not valids: continue
-                s0 = valids[0]; e0 = s0 + dur_slots
+                    candidates.append(s)
+                per_day_candidates[d]=candidates
+            # global ordered list across days: iterate day order then time
+            ordered = [(d, s) for d in allowed_days for s in per_day_candidates.get(d, [])]
+            if start_index>0:
+                ordered = ordered[start_index:]
+            for d, s0 in ordered:
+                if want<=0: break
+                if not ok_gap(d):
+                    continue
+                e0 = s0 + dur_slots
                 placed.append({"block_id": f"B_{uuid.uuid4().hex[:8]}","client_id": spec["client_id"],"day": d,"start": slot_to_time(s0),"end": slot_to_time(e0),"allow_split": True,"flex": True})
                 used_days.append(d); want -= 1
         return placed
 
     # Build using dynamic strategy: do not pre-split fixed blocks; allow adaptive splitting in later passes
+    # Flex blocks will be generated per-attempt within each pass using earliest-first and an offset
     flex_blocks = place_flex_blocks_one_plan(flex_specs, rng)
     all_blocks = fixed_blocks + flex_blocks
 
@@ -713,10 +720,14 @@ def solve_week(
                         order.append(bucket[cid].pop(0))
         return order
 
-    def candidate_caregivers(cl, cl_city):
+    def candidate_caregivers(cl, cl_city, day):
         cand = [c for c in caregivers if c.caregiver_id not in cl.banned_caregivers]
+        # continuity: caregivers already assigned to this client on this day first
+        same_day_set = {a.caregiver_id for a in assignments if a.client_id==cl.client_id and a.day==day}
+        # sort keys in increasing priority values (0 best)
         cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
         cand.sort(key=lambda cg: 0 if cg.base_location==cl_city else 1)
+        cand.sort(key=lambda cg: 0 if cg.caregiver_id in same_day_set else 1)
         return cand
 
     def travel_buffer_slots(city_a:str, city_b:str)->int:
@@ -791,7 +802,7 @@ def solve_week(
         if is_client_interval_fully_covered_by(assignments, cl.client_id, day, s, e):
             return True
         placed = False; local_excs=[]
-        for cg in candidate_caregivers(cl, cl_city):
+        for cg in candidate_caregivers(cl, cl_city, day):
             if (cl.client_id, day, slot_to_time(s), slot_to_time(e), cg.caregiver_id) in declined_blacklist:
                 local_excs.append((cg.caregiver_id, "Declined earlier")); continue
             ok, err, soft = can_place_single(cg, cl_city, day, s, e)
@@ -852,6 +863,22 @@ def solve_week(
             if right_ok:
                 placed = try_assign_segment(cl, cl_city, day, mid, e)
                 any_placed = any_placed or placed
+        # If still nothing, place the single largest feasible chunk within [s,e]
+        if not any_placed:
+            cand = []
+            for i in range(len(pts)-1):
+                a, b = pts[i], pts[i+1]
+                if a >= b: continue
+                if (b - a) >= min_subblock_slots:
+                    cand.append((a, b))
+            # also consider full window if it meets threshold (will be skipped in split passes because caller skips whole before calling us)
+            if (e - s) >= min_subblock_slots:
+                cand.append((s, e))
+            cand.sort(key=lambda x: (x[1]-x[0]), reverse=True)
+            for a,b in cand:
+                if try_assign_segment(cl, cl_city, day, a, b):
+                    any_placed = True
+                    break
         return any_placed
 
     # Manual overlap behavior: if fully covered by existing (locks incl. manual), skip;
@@ -890,6 +917,23 @@ def solve_week(
             if any(a.client_id==clid and a.day==day and a.start_time==stt and a.end_time==enn for a in assignments): continue
             force_place(clid, day, stt, enn, cg_id, status="Assigned (Approved)")
 
+        # Helper to compute a reasonable cap on flex attempts across time candidates
+        def flex_max_attempts():
+            max_attempts = 1
+            for spec in flex_specs:
+                dur_slots = int(round(spec["duration"]*4))
+                ws = time_to_slot(spec["window_start"]); we = time_to_slot(spec["window_end"])
+                allowed_days = [d for d in DAYS_FULL if d in spec["days"]]
+                count = 0
+                for d in allowed_days:
+                    for s in range(ws, max(ws, we - dur_slots) + 1):
+                        e = s + dur_slots
+                        if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
+                        if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
+                        count += 1
+                max_attempts = max(max_attempts, count)
+            return max_attempts
+
         # Iterate restarts
         for it in range(max(1, int(iterations))):
             # Reset work logs each iteration (locks are already applied to assignments)
@@ -904,22 +948,35 @@ def solve_week(
             rng.seed(random_seed + pass_idx*1543 + it*7919)
             day_order = DAYS_FULL[:]; rng.shuffle(day_order)
 
-            for day in day_order:
-                seq = day_round_order(day)
-                for b in seq:
-                    cl = client_map[b["client_id"]]; cl_city = cl.base_location
-                    s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
+            # Determine how many time-offset attempts we will try for flex in this pass
+            attempts_cap = flex_max_attempts()
+            # To control runtime, cap attempts to a reasonable number; prioritize earliest slots
+            attempts_cap = min(attempts_cap, 12)
+            for flex_attempt in range(attempts_cap):
+                # Build blocks for this time-offset attempt
+                flex_blocks = place_flex_blocks_one_plan(flex_specs, rng, start_index=flex_attempt)
+                all_blocks = fixed_blocks + flex_blocks
+                blocks_by_day = defaultdict(list)
+                lock_keys = set((clid, d, st, en) for (clid, d, st, en, _, _) in locks)
+                for b in all_blocks:
+                    if (b["client_id"], b["day"], b["start"], b["end"]) not in lock_keys:
+                        blocks_by_day[b["day"]].append(b)
 
-                    if is_client_interval_fully_covered_by(assignments, cl.client_id, day, s, e):
-                        continue
-                    if has_partial_overlap(cl.client_id, day, s, e):
-                        continue
+                for day in day_order:
+                    seq = day_round_order(day)
+                    for b in seq:
+                        cl = client_map[b["client_id"]]; cl_city = cl.base_location
+                        s=time_to_slot(b["start"]); e=time_to_slot(b["end"])
 
-                    if try_assign_segment(cl, cl_city, day, s, e):
-                        continue
+                        if is_client_interval_fully_covered_by(assignments, cl.client_id, day, s, e):
+                            continue
+                        if has_partial_overlap(cl.client_id, day, s, e):
+                            continue
 
-                    # Adaptive splitting based on current pass threshold and allowance
-                    adaptive_split_and_place(cl, day, s, e, min_subblock_slots=min_subblock_slots, allow_split=allow_split)
+                        if not allow_split:
+                            if try_assign_segment(cl, cl_city, day, s, e):
+                                continue
+                        adaptive_split_and_place(cl, day, s, e, min_subblock_slots=min_subblock_slots, allow_split=allow_split)
 
             sc = score_solution(assignments, pr_map, {c.caregiver_id:c for c in caregivers})
             if best_score is None or sc>best_score:
