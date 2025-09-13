@@ -146,6 +146,7 @@ class Caregiver:
     notes: str = ""
     work_log: Dict[str, List[Tuple[int,int,str]]] = field(default_factory=lambda: defaultdict(list))
     daily_city_trips: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    at_capacity: bool = False
 
 @dataclass
 class Client:
@@ -158,6 +159,7 @@ class Client:
     banned_caregivers: List[str]
     requests: List[Dict]
     notes: str = ""
+    all_shifts_filled: bool = False
 
 @dataclass
 class ScheduleEntry:
@@ -469,6 +471,22 @@ def build_caregiver_objects_from_dfs(dfs):
         ))
     return caregivers
 
+def build_total_availability_matrix(caregivers: List[Caregiver]) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    total = pd.DataFrame(0, index=TIME_OPTS, columns=DAYS_FULL)
+    per_cg = {}
+    for cg in caregivers:
+        mat = pd.DataFrame(0, index=TIME_OPTS, columns=DAYS_FULL)
+        for dshort, segs in cg.availability.items():
+            day = SHORT_TO_UI.get(dshort, dshort)
+            for seg in segs:
+                st = time_to_slot(seg.get("start", "")); en = time_to_slot(seg.get("end", ""))
+                for s in range(st, en):
+                    t = slot_to_time(s)
+                    mat.at[t, day] += 1
+                    total.at[t, day] += 1
+        per_cg[cg.caregiver_id] = mat
+    return total, per_cg
+
 # ============ Uncovered overlays ============
 def compute_all_requested_blocks(clients:List[Client], fixed_split_mode:str="91215"):
     fixed_blocks, flex_specs = [], []
@@ -713,21 +731,28 @@ def solve_week(
                 dct[cid].sort(key=lambda x: time_to_slot(x["start"]))
         order=[]
         for bucket in (pref, nonpref):
-            keys = sorted(bucket.keys(), key=lambda cid: -client_map[cid].priority)
+            keys = list(bucket.keys())
+            rng.shuffle(keys)
+            keys.sort(key=lambda cid: -client_map[cid].priority)
             while any(bucket.values()):
                 for cid in keys:
                     if bucket[cid]:
                         order.append(bucket[cid].pop(0))
+        rng.shuffle(order)
         return order
 
     def candidate_caregivers(cl, cl_city, day):
         cand = [c for c in caregivers if c.caregiver_id not in cl.banned_caregivers]
-        # continuity: caregivers already assigned to this client on this day first
         same_day_set = {a.caregiver_id for a in assignments if a.client_id==cl.client_id and a.day==day}
-        # sort keys in increasing priority values (0 best)
-        cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
+        rng.shuffle(cand)
         cand.sort(key=lambda cg: 0 if cg.base_location==cl_city else 1)
         cand.sort(key=lambda cg: 0 if cg.caregiver_id in same_day_set else 1)
+        if cl.top_caregivers:
+            cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
+        else:
+            def total_hours(cg:Caregiver)->float:
+                return sum((e-s) for blocks in cg.work_log.values() for s,e,_ in blocks)
+            cand.sort(key=total_hours)
         return cand
 
     def travel_buffer_slots(city_a:str, city_b:str)->int:
@@ -1046,7 +1071,7 @@ def parse_manual_matrix_to_blocks(mat:pd.DataFrame, client_name:str)->List[Dict]
     return out
 
 # ============ UI ============
-tabs = st.tabs(["Caregivers","Clients","Schedules","Exceptions","Settings"])
+tabs = st.tabs(["Caregivers","Clients","Schedules","Exceptions","Insights","Settings"])
 
 # CAREGIVERS
 with tabs[0]:
@@ -1213,6 +1238,12 @@ with tabs[2]:
     if st.button("▶️ Solve Schedules (run solver)"):
         caregivers = build_caregiver_objects_from_dfs(dfs)
         clients = build_client_objects_from_dfs(dfs)
+        total_avail, per_cg_avail = build_total_availability_matrix(caregivers)
+        st.session_state["total_availability"] = total_avail
+        st.session_state["remaining_availability"] = total_avail.copy()
+        st.session_state["per_cg_availability"] = per_cg_avail
+        st.session_state["cg_at_capacity"] = {c.caregiver_id: False for c in caregivers}
+        st.session_state["cl_all_filled"] = {c.client_id: False for c in clients}
         result = solve_week(
             caregivers=caregivers, clients=clients, approvals_df=dfs["approvals"],
             iterations=int(st.session_state["solver_iters"]), per_iter_time=int(st.session_state["solver_time"]),
@@ -1230,6 +1261,29 @@ with tabs[2]:
         }])], ignore_index=True)
         save_csv_safe(ITER_LOG_FILE, it_df)
         dfs = load_ui_csvs()
+        caregivers_post = build_caregiver_objects_from_dfs(dfs)
+        clients_post = build_client_objects_from_dfs(dfs)
+        best = dfs["best"]
+        remaining = st.session_state["remaining_availability"]
+        cg_hours = defaultdict(float)
+        for _, r in best.iterrows():
+            st_slot = time_to_slot(r["start_time"]); en_slot = time_to_slot(r["end_time"])
+            cg_hours[r["caregiver_id"]] += (en_slot - st_slot) / 4
+            for s in range(st_slot, en_slot):
+                t = slot_to_time(s)
+                remaining.at[t, r["day"]] = max(0, remaining.at[t, r["day"]] - 1)
+        for cg in caregivers_post:
+            assigned = cg_hours.get(cg.caregiver_id, 0)
+            if cg.max_week_hours and (cg.max_week_hours - assigned) <= 2:
+                st.session_state["cg_at_capacity"][cg.caregiver_id] = True
+                mat = st.session_state["per_cg_availability"].get(cg.caregiver_id)
+                if mat is not None:
+                    remaining = remaining - mat
+        remaining[remaining < 0] = 0
+        st.session_state["remaining_availability"] = remaining
+        _, per_client_unfilled = compute_uncovered(dfs)
+        for cl in clients_post:
+            st.session_state["cl_all_filled"][cl.client_id] = len(per_client_unfilled.get(cl.client_id, [])) == 0
         st.success(f"Solve complete. Best score={result.diagnostics.get('score',0.0)}. Exceptions added: {len(result.pending_exceptions)}")
 
     sch_sub = st.tabs(["Caregivers","Clients","Manual Shift Assignment"])
@@ -1238,6 +1292,8 @@ with tabs[2]:
         st.subheader("Caregiver Schedule Viewer")
         cg_names = sort_by_last_name(dfs["caregivers"]["Name"].tolist())
         sel_cg = st.selectbox("Select Caregiver", options=[""]+cg_names, key="sched_cg_select")
+        if sel_cg:
+            st.caption(f"At Capacity: {st.session_state.get('cg_at_capacity', {}).get(sel_cg, False)}")
         mat = render_schedule_matrix(dfs["best"], mode="caregiver", person=sel_cg)
         st.dataframe(mat, use_container_width=True, height=2000)
 
@@ -1245,6 +1301,8 @@ with tabs[2]:
         st.subheader("Client Schedule Viewer")
         cl_names = sort_by_last_name(dfs["clients"]["Name"].tolist())
         sel_cl = st.selectbox("Select Client", options=[""]+cl_names, key="sched_client_select")
+        if sel_cl:
+            st.caption(f"All Shifts Filled: {st.session_state.get('cl_all_filled', {}).get(sel_cl, False)}")
         base = render_schedule_matrix(dfs["best"], mode="client", person=sel_cl)
         all_uncovered, per_client_unfilled = compute_uncovered(dfs)
         overlay_list = per_client_unfilled.get(sel_cl, [])
@@ -1378,8 +1436,20 @@ with tabs[3]:
     st.subheader("Approval History")
     st.dataframe(dfs["approvals"], use_container_width=True, height=400)
 
-# SETTINGS
+# INSIGHTS
 with tabs[4]:
+    st.header("Insights")
+    tot = st.session_state.get("total_availability")
+    rem = st.session_state.get("remaining_availability")
+    if isinstance(tot, pd.DataFrame):
+        st.subheader("Total Availability Matrix")
+        st.dataframe(tot, use_container_width=True, height=800)
+    if isinstance(rem, pd.DataFrame):
+        st.subheader("Remaining Availability Matrix")
+        st.dataframe(rem, use_container_width=True, height=800)
+
+# SETTINGS
+with tabs[5]:
     st.header("Settings")
     st.subheader("Solver Settings")
     st.session_state["solver_iters"] = st.number_input("Iterative solving (restarts)", min_value=1, value=st.session_state["solver_iters"], step=1, key="iterative_solving_count_settings")
