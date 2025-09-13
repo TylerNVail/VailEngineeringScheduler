@@ -471,22 +471,6 @@ def build_caregiver_objects_from_dfs(dfs):
         ))
     return caregivers
 
-def build_total_availability_matrix(caregivers: List[Caregiver]) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    total = pd.DataFrame(0, index=TIME_OPTS, columns=DAYS_FULL)
-    per_cg = {}
-    for cg in caregivers:
-        mat = pd.DataFrame(0, index=TIME_OPTS, columns=DAYS_FULL)
-        for dshort, segs in cg.availability.items():
-            day = SHORT_TO_UI.get(dshort, dshort)
-            for seg in segs:
-                st = time_to_slot(seg.get("start", "")); en = time_to_slot(seg.get("end", ""))
-                for s in range(st, en):
-                    t = slot_to_time(s)
-                    mat.at[t, day] += 1
-                    total.at[t, day] += 1
-        per_cg[cg.caregiver_id] = mat
-    return total, per_cg
-
 # ============ Uncovered overlays ============
 def compute_all_requested_blocks(clients:List[Client], fixed_split_mode:str="91215"):
     fixed_blocks, flex_specs = [], []
@@ -1238,12 +1222,6 @@ with tabs[2]:
     if st.button("▶️ Solve Schedules (run solver)"):
         caregivers = build_caregiver_objects_from_dfs(dfs)
         clients = build_client_objects_from_dfs(dfs)
-        total_avail, per_cg_avail = build_total_availability_matrix(caregivers)
-        st.session_state["total_availability"] = total_avail
-        st.session_state["remaining_availability"] = total_avail.copy()
-        st.session_state["per_cg_availability"] = per_cg_avail
-        st.session_state["cg_at_capacity"] = {c.caregiver_id: False for c in caregivers}
-        st.session_state["cl_all_filled"] = {c.client_id: False for c in clients}
         result = solve_week(
             caregivers=caregivers, clients=clients, approvals_df=dfs["approvals"],
             iterations=int(st.session_state["solver_iters"]), per_iter_time=int(st.session_state["solver_time"]),
@@ -1261,29 +1239,6 @@ with tabs[2]:
         }])], ignore_index=True)
         save_csv_safe(ITER_LOG_FILE, it_df)
         dfs = load_ui_csvs()
-        caregivers_post = build_caregiver_objects_from_dfs(dfs)
-        clients_post = build_client_objects_from_dfs(dfs)
-        best = dfs["best"]
-        remaining = st.session_state["remaining_availability"]
-        cg_hours = defaultdict(float)
-        for _, r in best.iterrows():
-            st_slot = time_to_slot(r["start_time"]); en_slot = time_to_slot(r["end_time"])
-            cg_hours[r["caregiver_id"]] += (en_slot - st_slot) / 4
-            for s in range(st_slot, en_slot):
-                t = slot_to_time(s)
-                remaining.at[t, r["day"]] = max(0, remaining.at[t, r["day"]] - 1)
-        for cg in caregivers_post:
-            assigned = cg_hours.get(cg.caregiver_id, 0)
-            if cg.max_week_hours and (cg.max_week_hours - assigned) <= 2:
-                st.session_state["cg_at_capacity"][cg.caregiver_id] = True
-                mat = st.session_state["per_cg_availability"].get(cg.caregiver_id)
-                if mat is not None:
-                    remaining = remaining - mat
-        remaining[remaining < 0] = 0
-        st.session_state["remaining_availability"] = remaining
-        _, per_client_unfilled = compute_uncovered(dfs)
-        for cl in clients_post:
-            st.session_state["cl_all_filled"][cl.client_id] = len(per_client_unfilled.get(cl.client_id, [])) == 0
         st.success(f"Solve complete. Best score={result.diagnostics.get('score',0.0)}. Exceptions added: {len(result.pending_exceptions)}")
 
     sch_sub = st.tabs(["Caregivers","Clients","Manual Shift Assignment"])
