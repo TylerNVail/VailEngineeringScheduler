@@ -657,7 +657,7 @@ def representative_slot_for_flex(spec)->Optional[Tuple[str,str,str]]:
     ws = time_to_slot(spec["window_start"]); we = time_to_slot(spec["window_end"])
     for d in spec["days"]:
         step_slots = max(1, int(st.session_state.get("flex_slide_step_hours", 1))*4)
-                    for s in range(ws, max(ws, we - dur_slots) + 1, step_slots):
+        for s in range(ws, max(ws, we - dur_slots) + 1, step_slots):
             e = s + dur_slots
             if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
             if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
@@ -835,7 +835,7 @@ def solve_week(
                         continue
                     candidates.append(s)
                 per_day_candidates[d] = candidates
-ordered = [(d, s) for d in allowed_days for s in per_day_candidates.get(d, [])]
+            ordered = [(d, s) for d in allowed_days for s in per_day_candidates.get(d, [])]
             if start_index>0:
                 ordered = ordered[start_index:]
             for d, s0 in ordered:
