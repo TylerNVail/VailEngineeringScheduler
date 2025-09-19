@@ -1700,3 +1700,87 @@ with tabs[5]:
 
 # Footer
 st.markdown('<div class="app-footer">By: Vail Engineering</div>', unsafe_allow_html=True)
+
+
+def place_flex_blocks_one_plan(flex_specs: List[Dict], rng: random.Random, start_index: int = 0) -> List[Dict]:
+    """
+    Build earliest-first per-day candidate windows for flexible shifts, with a configurable slide step.
+    Returns a list of dicts: {"client_id","day","start","end"}.
+    This function only proposes windows; actual assignment happens elsewhere.
+    """
+    placed = []
+    d2i = {d: i for i, d in enumerate(DAYS_FULL)}
+
+    for spec in flex_specs:
+        try:
+            dur_slots = int(round(spec["duration"] * 4))
+        except Exception:
+            continue
+        ws = time_to_slot(spec.get("window_start", "00:00"))
+        we = time_to_slot(spec.get("window_end", "24:00"))
+        allowed_days = [d for d in DAYS_FULL if d in spec.get("days", [])]
+        want = int(spec.get("blocks", 0) or 0)
+        if want <= 0 or not allowed_days:
+            continue
+
+        used_days = []
+
+        def ok_gap(newd: str) -> bool:
+            if spec.get("consecutive", False):
+                return True
+            ni = d2i[newd]
+            return all(min((ni - d2i[u]) % 7, (d2i[u] - ni) % 7) >= 2 for u in used_days)
+
+        # Build candidate starts for each allowed day using slide step from settings
+        per_day_candidates = {}
+        step_hours = 1
+        try:
+            step_hours = int(st.session_state.get("flex_slide_step_hours", 1))
+        except Exception:
+            pass
+        step_slots = max(1, step_hours * 4)
+
+        for d in allowed_days:
+            candidates = []
+            s = ws
+            last_start = max(ws, we - dur_slots)
+            while s <= last_start:
+                e = s + dur_slots
+                if (time_to_slot("07:00") <= s < time_to_slot("22:00")) and (time_to_slot("07:00") < e <= time_to_slot("22:00")):
+                    candidates.append(s)
+                s += step_slots
+            per_day_candidates[d] = candidates
+
+        # Flatten and order candidates; prefer lower RAM average coverage if available
+        ordered = [(d, s) for d in allowed_days for s in per_day_candidates.get(d, [])]
+        try:
+            ordered.sort(key=lambda ds: live_ram.avg_cov(ds[0], ds[1], ds[1] + dur_slots))
+        except Exception:
+            pass
+
+        if ordered:
+            offset = start_index % len(ordered)
+            ordered = ordered[offset:] + ordered[:offset]
+
+        for (d, s) in ordered:
+            if want <= 0:
+                break
+            if not ok_gap(d):
+                continue
+            e = s + dur_slots
+            if 'label' in spec:
+                label = spec['label']
+            else:
+                label = "FlexCandidate"
+            placed.append({
+                "client_id": spec["client_id"],
+                "day": d,
+                "start": slot_to_time(s),
+                "end": slot_to_time(e),
+                "label": label
+            })
+            used_days.append(d)
+            want -= 1
+
+    return placed
+
