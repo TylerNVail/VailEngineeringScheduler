@@ -822,18 +822,20 @@ def solve_week(
                 ni = d2i[newd]
                 return all(min((ni - d2i[u]) % 7, (d2i[u] - ni) % 7) >= 2 for u in used_days)
             # build ordered candidate starts for each allowed day
+            
             per_day_candidates = {}
+            step_slots = max(1, int(st.session_state.get("flex_slide_step_hours", 1)) * 4)
             for d in allowed_days:
-                candidates=[]
-                step_slots = max(1, int(st.session_state.get("flex_slide_step_hours", 1))*4)
-                    for s in range(ws, max(ws, we - dur_slots) + 1, step_slots):
+                candidates = []
+                for s in range(ws, max(ws, we - dur_slots) + 1, step_slots):
                     e = s + dur_slots
-                    if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
-                    if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
+                    if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): 
+                        continue
+                    if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): 
+                        continue
                     candidates.append(s)
-                per_day_candidates[d]=candidates
-            # global ordered list across days: iterate day order then time
-            ordered = [(d, s) for d in allowed_days for s in per_day_candidates.get(d, [])]
+                per_day_candidates[d] = candidates
+ordered = [(d, s) for d in allowed_days for s in per_day_candidates.get(d, [])]
             if start_index>0:
                 ordered = ordered[start_index:]
             for d, s0 in ordered:
