@@ -118,57 +118,49 @@ def slot_to_time(s:int)->str:
     return "24:00" if m>=24*60 else f"{m//60:02d}:{m%60:02d}"
 
 
-# ============ Availability Matrices & Solver Enhancements (v2 additions) ============
+# ============ v3 Enhancements: TAM/RAM, LiveRAM, Flags, RNG, Orchestrator ============
 import numpy as _np
+from collections import defaultdict
 
 def compute_total_availability_matrix_from_dfs(dfs) -> pd.DataFrame:
-    """96x7 grid; each available caregiver contributes +1 per 15-min slot."""
     mat = pd.DataFrame(0, index=TIME_OPTS, columns=DAYS_FULL, dtype=int)
     av = dfs.get("caregiver_avail")
     if av is None or av.empty: 
         return mat
     for _, row in av.iterrows():
         day_val = str(row.get("Day","")).strip()
-        if not day_val: 
-            continue
+        if not day_val: continue
         day_full = day_val if day_val in DAYS_FULL else SHORT_TO_UI.get(day_val, day_val)
         if day_full not in DAYS_FULL: 
             continue
         st = str(row.get("Start","")).strip(); en = str(row.get("End","")).strip()
-        if not st or not en: 
-            continue
+        if not st or not en: continue
         s = time_to_slot(st); e = time_to_slot(en)
         for sl in range(max(0,s), min(96,e)):
             mat.at[slot_to_time(sl), day_full] += 1
     return mat
 
 def compute_remaining_availability_matrix_from_dfs(dfs, total_av_df: pd.DataFrame) -> pd.DataFrame:
-    """Copy TAM and subtract 1 for every scheduled segment in dfs['best']."""
     remaining = total_av_df.copy()
     best = dfs.get("best")
     if best is None or best.empty:
         return remaining
-    day_col = "day" if "day" in best.columns else "Day"
-    st_col  = "start_time" if "start_time" in best.columns else "Start"
-    en_col  = "end_time" if "end_time" in best.columns else "End"
     for _, r in best.iterrows():
-        day = r.get(day_col, "")
-        st  = str(r.get(st_col, "")).strip()
-        en  = str(r.get(en_col, "")).strip()
+        day = r.get("day", r.get("Day",""))
+        st  = str(r.get("start_time", r.get("Start",""))).strip()
+        en  = str(r.get("end_time", r.get("End",""))).strip()
         if not day or day not in remaining.columns or not st or not en:
             continue
         s = time_to_slot(st); e = time_to_slot(en)
         for sl in range(max(0,s), min(96,e)):
-            t = slot_to_time(sl)
-            remaining.at[t, day] = max(0, int(remaining.at[t, day]) - 1)
+            remaining.at[slot_to_time(sl), day] = max(0, int(remaining.at[slot_to_time(sl), day]) - 1)
     return remaining.astype(int)
 
 class LiveRAM:
-    """Mutable Remaining Availability Matrix to update during solve."""
     def __init__(self, total_av_df: pd.DataFrame):
         self._day_to_col = {d:i for i,d in enumerate(DAYS_FULL)}
         arr = total_av_df.reindex(columns=DAYS_FULL).fillna(0).astype(int).values
-        self._ram = _np.array(arr, dtype=int)  # rows=96 slots, cols=7 days
+        self._ram = _np.array(arr, dtype=int)  # [96 x 7]
     def dec(self, day: str, s_slot: int, e_slot: int):
         c = self._day_to_col.get(day); 
         if c is None: return
@@ -191,27 +183,21 @@ class LiveRAM:
         return pd.DataFrame(self._ram, index=TIME_OPTS, columns=DAYS_FULL)
 
 def ensure_boolean_columns_and_reset(dfs):
-    """Ensure At Capacity / All Shifts Filled columns exist and reset to False."""
-    # Caregivers
     cg = dfs["caregivers"].copy()
     if "At Capacity" not in cg.columns:
         cg["At Capacity"] = ""
     cg["At Capacity"] = "False"
-    save_csv_safe(CAREGIVER_FILE, cg)
-    dfs["caregivers"] = cg
-    # Clients
+    save_csv_safe(CAREGIVER_FILE, cg); dfs["caregivers"] = cg
+
     cl = dfs["clients"].copy()
     if "All Shifts Filled" not in cl.columns:
         cl["All Shifts Filled"] = ""
     cl["All Shifts Filled"] = "False"
-    save_csv_safe(CLIENT_FILE, cl)
-    dfs["clients"] = cl
+    save_csv_safe(CLIENT_FILE, cl); dfs["clients"] = cl
 
 def update_all_shifts_filled_flags(dfs):
-    """Flip 'All Shifts Filled' True when a client's requested windows are fully covered."""
     clients = build_client_objects_from_dfs(dfs)
     fixed_blocks, flex_specs = compute_all_requested_blocks(clients, fixed_split_mode="none")
-    # Build assigned spans
     assigned = dfs.get("best")
     covered = defaultdict(lambda: defaultdict(lambda: set()))
     if assigned is not None and not assigned.empty:
@@ -219,34 +205,28 @@ def update_all_shifts_filled_flags(dfs):
             clid = r["client_id"]; day = r["day"]
             s = time_to_slot(r["start_time"]); e = time_to_slot(r["end_time"])
             covered[clid][day].update(range(s,e))
-    # Build needs
     needs = defaultdict(lambda: defaultdict(lambda: set()))
     for b in fixed_blocks:
         s = time_to_slot(b["start"]); e = time_to_slot(b["end"])
         needs[b["client_id"]][b["day"]].update(range(s,e))
-    # (A light flex representative check)
     for spec in flex_specs:
+        # approximate representative coverage for flags
         for _ in range(int(spec["blocks"])):
             rep = representative_slot_for_flex(spec)
-            if not rep: continue
-            d, st, en = rep
-            s = time_to_slot(st); e = time_to_slot(en)
-            needs[spec["client_id"]][d].update(range(s,e))
-    # Decide flags
-    cl = dfs["clients"].copy()
-    for cid in cl["Name"].tolist():
-        want = needs.get(cid, {})
-        if not want:
-            cl.loc[cl["Name"]==cid, "All Shifts Filled"] = "False"; continue
-        all_ok = True
-        for day, req in want.items():
-            if not req.issubset(covered.get(cid, {}).get(day, set())):
+            if rep:
+                d, st, en = rep
+                s = time_to_slot(st); e = time_to_slot(en)
+                needs[spec["client_id"]][d].update(range(s,e))
+    cldf = dfs["clients"].copy()
+    for cid in cldf["Name"].tolist():
+        want = needs.get(cid, {}); all_ok = bool(want)
+        for d, req in want.items():
+            if not req.issubset(covered.get(cid, {}).get(d, set())):
                 all_ok = False; break
-        cl.loc[cl["Name"]==cid, "All Shifts Filled"] = "True" if all_ok else "False"
-    save_csv_safe(CLIENT_FILE, cl); dfs["clients"] = cl
+        cldf.loc[cldf["Name"]==cid, "All Shifts Filled"] = "True" if all_ok else "False"
+    save_csv_safe(CLIENT_FILE, cldf); dfs["clients"] = cldf
 
 class SolveRNG:
-    """Different RNG per iteration; reproducible if seed provided; random if not."""
     def __init__(self, base_seed=None, iteration_index: int=0):
         import secrets, random as _random
         if base_seed is None or str(base_seed).strip()=="":
@@ -259,6 +239,35 @@ class SolveRNG:
             seed = (base ^ (iteration_index*0x9E3779B97F4A7C15)) & ((1<<64)-1)
         self.rng = _random.Random(seed)
         self.seed_used = seed
+
+class FactorialPassOrchestrator:
+    """Repeats 10→1 cycles until every shift (in current mode/bucket) has been attempted."""
+    def __init__(self, clients_by_priority, unattempted_by_client, rng):
+        self.cbyp = {int(p): list(v) for p, v in clients_by_priority.items()}
+        for p in range(1, 11):
+            self.cbyp.setdefault(p, [])
+        self.unattempted = {c: set(s) for c, s in unattempted_by_client.items()}
+        self.rng = rng
+        for p in self.cbyp:
+            self.rng.shuffle(self.cbyp[p])
+    def __iter__(self):
+        while any(self.unattempted.get(c) for c in self.unattempted):
+            yielded = False
+            for depth in range(10, 0, -1):
+                included = list(range(10, depth-1, -1))
+                for p in included:
+                    clients = [c for c in self.cbyp.get(p, []) if self.unattempted.get(c)]
+                    if not clients: continue
+                    self.rng.shuffle(clients)
+                    for c in clients:
+                        sids = list(self.unattempted[c])
+                        if not sids: continue
+                        sid = self.rng.choice(sids)
+                        self.unattempted[c].discard(sid)
+                        yielded = True
+                        yield (c, sid)
+            if not yielded:
+                break
 
 def drop_empty_rows(df):
     if df is None or df.empty: return pd.DataFrame(columns=df.columns)
@@ -647,7 +656,8 @@ def representative_slot_for_flex(spec)->Optional[Tuple[str,str,str]]:
     dur_slots = int(round(spec["duration"]*4))
     ws = time_to_slot(spec["window_start"]); we = time_to_slot(spec["window_end"])
     for d in spec["days"]:
-        for s in range(ws, max(ws, we - dur_slots) + 1):
+        step_slots = max(1, int(st.session_state.get("flex_slide_step_hours", 1))*4)
+                    for s in range(ws, max(ws, we - dur_slots) + 1, step_slots):
             e = s + dur_slots
             if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
             if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
@@ -790,7 +800,8 @@ def solve_week(
             elif dec == "declined":
                 declined_blacklist.add(key)
 
-    rng = random.Random(random_seed)
+    rng = random.Random(random_seed)  # legacy init; will be replaced per pass/iteration
+    _base_seed = st.session_state.get("rng_seed","")
     fixed_blocks, flex_specs = compute_all_requested_blocks(clients, fixed_split_mode="none")
     pr_map = {c.client_id: c.priority for c in clients}
     client_map = {c.client_id: c for c in clients}
@@ -814,7 +825,8 @@ def solve_week(
             per_day_candidates = {}
             for d in allowed_days:
                 candidates=[]
-                for s in range(ws, max(ws, we - dur_slots) + 1):
+                step_slots = max(1, int(st.session_state.get("flex_slide_step_hours", 1))*4)
+                    for s in range(ws, max(ws, we - dur_slots) + 1, step_slots):
                     e = s + dur_slots
                     if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
                     if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
@@ -822,11 +834,6 @@ def solve_week(
                 per_day_candidates[d]=candidates
             # global ordered list across days: iterate day order then time
             ordered = [(d, s) for d in allowed_days for s in per_day_candidates.get(d, [])]
-            # v2: prefer candidate windows with lower RAM average coverage
-            try:
-                ordered.sort(key=lambda ds: live_ram.avg_cov(ds[0], ds[1], ds[1]+dur_slots))
-            except Exception:
-                pass
             if start_index>0:
                 ordered = ordered[start_index:]
             for d, s0 in ordered:
@@ -843,9 +850,9 @@ def solve_week(
     flex_blocks = place_flex_blocks_one_plan(flex_specs, rng)
     all_blocks = fixed_blocks + flex_blocks
 
-    
-    # ---- v2: build TAM from caregivers and initialize LiveRAM ----
-    def build_tam_from_caregivers():
+
+    # ---- v3: build TAM from caregivers and initialize LiveRAM ----
+    def _tam_from_caregivers():
         df = pd.DataFrame(0, index=TIME_OPTS, columns=DAYS_FULL, dtype=int)
         for cg in caregivers:
             for dshort, segs in cg.availability.items():
@@ -858,11 +865,10 @@ def solve_week(
                     for sl in range(max(0,s), min(96,e)):
                         df.at[slot_to_time(sl), day_full] += 1
         return df
-    live_ram = LiveRAM(build_tam_from_caregivers())
-
-    # Current mode tag for candidate filtering (pref/nonpref/samecity/opposite)
+    live_ram = LiveRAM(_tam_from_caregivers())
     current_mode = "pref_whole"
-# index by day, excluding locks
+
+    # index by day, excluding locks
     blocks_by_day = defaultdict(list)
     lock_keys = set((clid, d, st, en) for (clid, d, st, en, _, _) in locks)
     for b in all_blocks:
@@ -879,27 +885,38 @@ def solve_week(
             for cid in dct:
                 dct[cid].sort(key=lambda x: time_to_slot(x["start"]))
         order=[]
-        for bucket in (pref, nonpref):
-            keys = sorted(bucket.keys(), key=lambda cid: -client_map[cid].priority)
-            while any(bucket.values()):
-                for cid in keys:
-                    if bucket[cid]:
-                        order.append(bucket[cid].pop(0))
+        def order_bucket(bucket):
+            # Build clients_by_priority and unattempted maps
+            clients_by_priority = defaultdict(list)
+            for cid in bucket:
+                p = int(client_map[cid].priority)
+                clients_by_priority[p].append(cid)
+            sid_to_block = {}
+            unattempted = {}
+            for cid, blist in bucket.items():
+                sids = []
+                for i, bb in enumerate(blist):
+                    sid = f"{cid}|{i}"
+                    sid_to_block[sid] = bb
+                    sids.append(sid)
+                unattempted[cid] = set(sids)
+            for cid, sid in FactorialPassOrchestrator(clients_by_priority, unattempted, rng):
+                order.append(sid_to_block[sid])
+        # Preferred first, then non-preferred
+        order_bucket(pref)
+        order_bucket(nonpref)
         return order
 
     def candidate_caregivers(cl, cl_city, day):
-        # Build initial pool excluding banned caregivers
         cand = [c for c in caregivers if c.caregiver_id not in cl.banned_caregivers]
-        # Temporary home base = city of last assignment that day; otherwise base
+        # Temporary home base: city of last assignment today, else base
         def current_city(cg):
             blocks = sorted(cg.work_log.get(day, []), key=lambda x:x[0])
             if blocks:
                 _, _, last_clid = blocks[-1]
                 return cl_city_for(last_clid)
             return cg.base_location
-        # Continuity: caregivers already with this client today
         same_day_set = {a.caregiver_id for a in assignments if a.client_id==cl.client_id and a.day==day}
-        # Filter by current_mode (preferred / same-city / opposite-city), if present
         pool = []
         for cg in cand:
             ok = True
@@ -908,7 +925,6 @@ def solve_week(
             elif current_mode.startswith("nonpref_samecity_"):
                 ok = (cg.caregiver_id not in cl.top_caregivers) and (current_city(cg)==cl_city)
             elif current_mode.startswith("nonpref_opposite_"):
-                # Only matters for Paradise/Chico pair
                 if cl_city in ("Paradise","Chico"):
                     opposite = "Chico" if cl_city=="Paradise" else "Paradise"
                     ok = (cg.caregiver_id not in cl.top_caregivers) and (current_city(cg)==opposite or cg.base_location==opposite)
@@ -917,7 +933,7 @@ def solve_week(
             if ok:
                 pool.append(cg)
         cand = pool
-        # Sort by: continuity with client today, same current city as client city, preferred caregivers
+        # Sort by continuity with client today, same current city as client city, then preferred
         cand.sort(key=lambda cg: 0 if cg.caregiver_id in same_day_set else 1)
         cand.sort(key=lambda cg: 0 if current_city(cg)==cl_city else 1)
         cand.sort(key=lambda cg: 0 if cg.caregiver_id in cl.top_caregivers else 1)
@@ -946,7 +962,7 @@ def solve_week(
 
     def add_assignment(cg:Caregiver, day:str, start_slot:int, end_slot:int, client_id:str):
         cg.work_log[day].append((start_slot, end_slot, client_id))
-        # v2: decrement live RAM for these slots
+        # v3: decrement live RAM for these slots
         try:
             live_ram.dec(day, start_slot, end_slot)
         except Exception:
@@ -962,34 +978,6 @@ def solve_week(
             _,_,rclid = blocks[idx+1]
             if is_pc(cl_city_for(rclid), cl_city_for(client_id)):
                 cg.daily_city_trips[day] += 1
-        # v2: if within 2h of weekly max, mark At Capacity in-memory and remove leftover availability from RAM
-        try:
-            if cg.max_week_hours and (int(round(float(cg.max_week_hours)*60)) - current_week_minutes(cg)) <= 120:
-                # remove leftover availability (available slots minus assigned slots)
-                day_av = {d:set() for d in DAYS_FULL}
-                for dshort, segs in cg.availability.items():
-                    dfull = SHORT_TO_UI.get(dshort, dshort)
-                    sset=set()
-                    for seg in segs:
-                        st = time_to_slot(seg.get("start","00:00")); en = time_to_slot(seg.get("end","00:00"))
-                        sset.update(range(max(0,st), min(96,en)))
-                    day_av[dfull] = sset
-                day_asg = {d:set() for d in DAYS_FULL}
-                for d, blks in cg.work_log.items():
-                    for ss, ee, _ in blks:
-                        day_asg[d].update(range(ss, ee))
-                # decrement RAM for leftover
-                for d in DAYS_FULL:
-                    leftover = day_av[d] - day_asg[d]
-                    if leftover:
-                        idx = list(sorted(leftover))
-                        for sl in idx:
-                            try:
-                                live_ram.dec(d, sl, sl+1)
-                            except Exception:
-                                pass
-        except Exception:
-            pass
 
     def can_place_single(cg:Caregiver, cl_city:str, day:str, s:int, e:int)->Tuple[bool, Optional[str], bool]:
         hard_ok, soft_prefer = is_available(cg, day, slot_to_time(s), slot_to_time(e))
@@ -1000,6 +988,41 @@ def solve_week(
         if cg.as_many_hours and (current_week_minutes(cg) + (e-s)*15 > AS_MANY_WEEK_CAP_MIN): return (False, "Weekly hours >50 (as-many)", soft_prefer)
         violates, ex_type = will_violate_travel(cg, day, s, e, cl_city)
         if violates: return (False, ex_type or "Travel", soft_prefer)
+        # v3: If within 2h of weekly max, mark At Capacity and remove leftover from RAM
+        try:
+            if cg.max_week_hours and (int(round(float(cg.max_week_hours)*60)) - current_week_minutes(cg)) <= 120:
+                # mark CSV flag
+                try:
+                    dfc = dfs["caregivers"].copy()
+                    if "At Capacity" in dfc.columns:
+                        dfc.loc[dfc["Name"]==cg.caregiver_id, "At Capacity"] = "True"
+                        save_csv_safe(CAREGIVER_FILE, dfc); dfs["caregivers"] = dfc
+                except Exception:
+                    pass
+                # remove leftover availability
+                day_av = {d:set() for d in DAYS_FULL}
+                for dshort, segs in cg.availability.items():
+                    dfull = SHORT_TO_UI.get(dshort, dshort)
+                    if dfull not in DAYS_FULL: continue
+                    for seg in segs:
+                        s = time_to_slot(seg.get("start","00:00")); e = time_to_slot(seg.get("end","00:00"))
+                        day_av[dfull].update(range(s,e))
+                day_asg = {d:set() for d in DAYS_FULL}
+                for d in cg.work_log:
+                    for (ss, ee, _) in cg.work_log[d]:
+                        day_asg[d].update(range(ss, ee))
+                leftover = {d:(day_av[d]-day_asg[d]) for d in DAYS_FULL}
+                for d, slots in leftover.items():
+                    try:
+                        cidx = {dn:i for i,dn in enumerate(DAYS_FULL)}.get(d)
+                        if cidx is None: continue
+                        for sl in slots:
+                            if 0<=sl<96:
+                                live_ram._ram[sl, cidx] = max(0, live_ram._ram[sl, cidx]-1)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         return (True, None, soft_prefer)
 
     assignments=[]; exceptions=[]
@@ -1024,10 +1047,10 @@ def solve_week(
         force_place(clid, day, stt, enn, cg_id, status="Assigned (Approved)")
 
     def try_assign_segment(cl, cl_city, day, s, e):
-        # v2: skip if RAM shows any zero coverage in this window (for flex and general)
+        # v3: RAM gate — skip windows with any zero coverage
         try:
             if not live_ram.ram_has_full_coverage(day, s, e):
-                return True  # treat as attempted; avoid impossible windows
+                return True
         except Exception:
             pass
         # Already fully covered for this client/day window?
@@ -1158,7 +1181,8 @@ def solve_week(
                 allowed_days = [d for d in DAYS_FULL if d in spec["days"]]
                 count = 0
                 for d in allowed_days:
-                    for s in range(ws, max(ws, we - dur_slots) + 1):
+                    step_slots = max(1, int(st.session_state.get("flex_slide_step_hours", 1))*4)
+                    for s in range(ws, max(ws, we - dur_slots) + 1, step_slots):
                         e = s + dur_slots
                         if not (time_to_slot("07:00") <= s < time_to_slot("22:00")): continue
                         if not (time_to_slot("07:00") < e <= time_to_slot("22:00")): continue
@@ -1177,7 +1201,7 @@ def solve_week(
                 if cg:
                     add_assignment(cg, a.day, time_to_slot(a.start_time), time_to_slot(a.end_time), a.client_id)
 
-            rng = SolveRNG(base_seed=st.session_state.get("rng_seed",""), iteration_index=it + pass_idx*1000).rng
+            rng = SolveRNG(base_seed=_base_seed, iteration_index=(it + pass_idx*1000)).rng
             day_order = DAYS_FULL[:]; rng.shuffle(day_order)
 
             # Determine how many time-offset attempts we will try for flex in this pass
@@ -1480,7 +1504,6 @@ with tabs[2]:
         }])], ignore_index=True)
         save_csv_safe(ITER_LOG_FILE, it_df)
         dfs = load_ui_csvs()
-        # v2: update All Shifts Filled flags based on best solution
         try:
             update_all_shifts_filled_flags(dfs)
             dfs = load_ui_csvs()
@@ -1494,13 +1517,6 @@ with tabs[2]:
         st.subheader("Caregiver Schedule Viewer")
         cg_names = sort_by_last_name(dfs["caregivers"]["Name"].tolist())
         sel_cg = st.selectbox("Select Caregiver", options=[""]+cg_names, key="sched_cg_select")
-        if sel_cg:
-            try:
-                row = dfs["caregivers"][dfs["caregivers"]["Name"]==sel_cg]
-                at_cap = str(row.iloc[0].get("At Capacity","False")).strip().lower() in ("true","1","t","yes","y") if not row.empty else False
-                st.caption(f"At Capacity: {'✅' if at_cap else '❌'}")
-            except Exception:
-                pass
         mat = render_schedule_matrix(dfs["best"], mode="caregiver", person=sel_cg)
         st.dataframe(mat, use_container_width=True, height=2000)
 
@@ -1508,13 +1524,6 @@ with tabs[2]:
         st.subheader("Client Schedule Viewer")
         cl_names = sort_by_last_name(dfs["clients"]["Name"].tolist())
         sel_cl = st.selectbox("Select Client", options=[""]+cl_names, key="sched_client_select")
-        if sel_cl:
-            try:
-                row = dfs["clients"][dfs["clients"]["Name"]==sel_cl]
-                all_filled = str(row.iloc[0].get("All Shifts Filled","False")).strip().lower() in ("true","1","t","yes","y") if not row.empty else False
-                st.caption(f"All Shifts Filled: {'✅' if all_filled else '❌'}")
-            except Exception:
-                pass
         base = render_schedule_matrix(dfs["best"], mode="client", person=sel_cl)
         all_uncovered, per_client_unfilled = compute_uncovered(dfs)
         overlay_list = per_client_unfilled.get(sel_cl, [])
@@ -1663,7 +1672,6 @@ with tabs[5]:
         help="Upper bound on multi-pass dynamic splitting rounds (recommended: 6)."
     )
     st.caption("Used when you click 'Solve Schedules' on the Schedules tab.")
-
     st.subheader("Advanced Heuristics")
     st.session_state["rng_seed"] = st.text_input("Random Seed (optional; leave blank for fresh randomness)", value=str(st.session_state.get("rng_seed","")))
     st.session_state["flex_slide_step_hours"] = st.number_input("Flexible shift slide step (hours)", min_value=1, max_value=12, value=int(st.session_state.get("flex_slide_step_hours", 1)), step=1)
