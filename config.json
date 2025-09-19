@@ -1,0 +1,12 @@
+{
+  "tv_ip": "192.168.86.45",
+  "tv_mac": "44:27:45:A6:24:7C",
+  "video_url": "https://www.youtube.com/watch?v=qXKsou9UmfY&t=804s",
+  "wake_first": true,
+  "post_wake_delay_sec": 12,
+  "post_connect_delay_sec": 2.5,
+  "pre_deeplink_wait_sec": 2.0,
+  "register_retry_count": 12,
+  "register_retry_sleep_sec": 3,
+  "youtube_app_id": "com.webos.app.youtube"
+}
